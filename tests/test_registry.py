@@ -28,6 +28,9 @@ def test_registry_exposes_every_expected_tool():
         "update_profile",
         "add_to_watchlist",
         "remove_from_watchlist",
+        "create_alert",
+        "list_alerts",
+        "cancel_alert",
     }
 
 

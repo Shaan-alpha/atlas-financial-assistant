@@ -1,6 +1,6 @@
 from datetime import datetime, timezone
 
-from sqlalchemy import DateTime, ForeignKey, Integer, String, Text
+from sqlalchemy import Boolean, DateTime, Float, ForeignKey, Integer, String, Text
 from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column
 
 
@@ -52,6 +52,26 @@ class WatchlistItem(Base):
     user_id: Mapped[int] = mapped_column(ForeignKey("users.id"), index=True)
     symbol: Mapped[str] = mapped_column(String(24))
     company: Mapped[str | None] = mapped_column(String(160), default=None)
+    created_at: Mapped[datetime] = mapped_column(DateTime, default=_utcnow)
+
+
+class Alert(Base):
+    """A watch the user asked for in plain language.
+
+    `description` keeps their own words so the notification can echo what they
+    actually asked for, rather than a machine restatement of it.
+    """
+
+    __tablename__ = "alerts"
+
+    id: Mapped[int] = mapped_column(primary_key=True)
+    user_id: Mapped[int] = mapped_column(ForeignKey("users.id"), index=True)
+    description: Mapped[str] = mapped_column(Text)
+    symbol: Mapped[str] = mapped_column(String(24), index=True)
+    kind: Mapped[str] = mapped_column(String(24))  # move_pct | price_above | price_below
+    threshold: Mapped[float] = mapped_column(Float)
+    active: Mapped[bool] = mapped_column(Boolean, default=True)
+    last_fired_at: Mapped[datetime | None] = mapped_column(DateTime, default=None)
     created_at: Mapped[datetime] = mapped_column(DateTime, default=_utcnow)
 
 

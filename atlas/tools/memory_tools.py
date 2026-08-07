@@ -8,9 +8,13 @@ from collections.abc import Callable
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 from atlas.memory import store
+from atlas.proactive import alerts
 from atlas.tools.result import err, ok
 
 SOURCE = "atlas-memory"
+
+# Imported rather than restated so the tool and the evaluator cannot drift apart.
+ALERT_KINDS = alerts.KINDS
 
 _VALID_TIME = re.compile(r"^([01]\d|2[0-3]):[0-5]\d$")
 
@@ -133,6 +137,48 @@ def make_memory_tools(user_id: int) -> list[Callable]:
         removed = store.forget(user_id, topic)
         return ok({"removed": removed, "topic": topic}, source=SOURCE)
 
+    def create_alert(
+        description: str, symbol: str, kind: str, threshold: float
+    ) -> dict:
+        """Set up a background watch on a security and notify the user when it hits.
+
+        Use whenever they ask to be told, alerted, pinged, or notified about a price
+        or a move. Do not promise to watch something without calling this.
+
+        Args:
+            description: What they asked for, in their own words.
+            symbol: Ticker symbol, e.g. "TSLA".
+            kind: "move_pct" for a daily move of at least threshold percent,
+                "price_above" or "price_below" for a price level.
+            threshold: Percent for move_pct, otherwise a price.
+        """
+        if kind not in ALERT_KINDS:
+            return err("bad_kind", f"kind must be one of: {', '.join(ALERT_KINDS)}.")
+        if threshold <= 0:
+            return err("bad_threshold", "Threshold must be greater than zero.")
+
+        alert_id = store.create_alert(user_id, description, symbol, kind, threshold)
+        return ok(
+            {"alert_id": alert_id, "symbol": symbol.upper(), "kind": kind,
+             "threshold": threshold},
+            source=SOURCE,
+        )
+
+    def list_alerts() -> dict:
+        """Return the watches currently armed for this user."""
+        return ok({"alerts": store.user_alerts(user_id)}, source=SOURCE)
+
+    def cancel_alert(symbol: str) -> dict:
+        """Turn off all watches on a security.
+
+        Args:
+            symbol: Ticker symbol to stop watching, e.g. "TSLA".
+        """
+        cancelled = store.cancel_alerts(user_id, symbol)
+        return ok(
+            {"symbol": symbol.upper(), "cancelled": cancelled}, source=SOURCE
+        )
+
     return [
         remember,
         recall,
@@ -140,4 +186,7 @@ def make_memory_tools(user_id: int) -> list[Callable]:
         update_profile,
         add_to_watchlist,
         remove_from_watchlist,
+        create_alert,
+        list_alerts,
+        cancel_alert,
     ]

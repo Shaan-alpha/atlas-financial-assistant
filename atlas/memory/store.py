@@ -1,4 +1,13 @@
-from atlas.db.models import MemoryFact, Message, SentSignal, User, WatchlistItem
+from datetime import datetime, timezone
+
+from atlas.db.models import (
+    Alert,
+    MemoryFact,
+    Message,
+    SentSignal,
+    User,
+    WatchlistItem,
+)
 from atlas.db.session import session_scope
 
 PROFILE_FIELDS = {"name", "role", "timezone", "briefing_time", "onboarding_state"}
@@ -158,6 +167,92 @@ def mark_sent(user_id: int, keys: list[str]) -> None:
     with session_scope() as s:
         for key in keys:
             s.add(SentSignal(user_id=user_id, signal_key=key))
+
+
+def create_alert(
+    user_id: int, description: str, symbol: str, kind: str, threshold: float
+) -> int:
+    with session_scope() as s:
+        alert = Alert(
+            user_id=user_id,
+            description=description.strip(),
+            symbol=symbol.strip().upper(),
+            kind=kind,
+            threshold=threshold,
+        )
+        s.add(alert)
+        s.flush()
+        return alert.id
+
+
+def user_alerts(user_id: int) -> list[dict]:
+    with session_scope() as s:
+        rows = (
+            s.query(Alert)
+            .filter_by(user_id=user_id, active=True)
+            .order_by(Alert.id)
+            .all()
+        )
+        return [
+            {
+                "id": r.id,
+                "description": r.description,
+                "symbol": r.symbol,
+                "kind": r.kind,
+                "threshold": r.threshold,
+            }
+            for r in rows
+        ]
+
+
+def active_alerts() -> list[dict]:
+    """Every armed alert across all users, for the watcher."""
+    with session_scope() as s:
+        rows = (
+            s.query(Alert, User.telegram_id)
+            .join(User, Alert.user_id == User.id)
+            .filter(Alert.active.is_(True))
+            .all()
+        )
+        return [
+            {
+                "id": a.id,
+                "user_id": a.user_id,
+                "telegram_id": tg,
+                "description": a.description,
+                "symbol": a.symbol,
+                "kind": a.kind,
+                "threshold": a.threshold,
+                "last_fired_at": a.last_fired_at,
+            }
+            for a, tg in rows
+        ]
+
+
+def mark_alert_fired(alert_id: int, when: datetime | None = None) -> None:
+    """Stamp the fire time.
+
+    `when` is passed in by the watcher so evaluation and bookkeeping share one
+    clock; taking wall-clock here would let cooldown disagree with the check that
+    just fired.
+    """
+    stamp = when or datetime.now(timezone.utc).replace(tzinfo=None)
+    with session_scope() as s:
+        alert = s.get(Alert, alert_id)
+        if alert is not None:
+            alert.last_fired_at = stamp
+
+
+def cancel_alerts(user_id: int, symbol: str) -> int:
+    with session_scope() as s:
+        rows = (
+            s.query(Alert)
+            .filter_by(user_id=user_id, symbol=symbol.strip().upper(), active=True)
+            .all()
+        )
+        for row in rows:
+            row.active = False
+        return len(rows)
 
 
 def append_message(user_id: int, role: str, content: str) -> None:

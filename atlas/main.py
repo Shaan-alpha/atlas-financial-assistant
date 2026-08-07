@@ -7,7 +7,7 @@ from atlas.config import get_settings
 from atlas.db.session import init_db
 from atlas.health import ping, start_health_server
 from atlas.ingress import handlers
-from atlas.proactive import scheduler
+from atlas.proactive import alerts, scheduler
 
 log = logging.getLogger(__name__)
 
@@ -49,6 +49,7 @@ def main() -> None:
 
     if app.job_queue is not None:
         scheduler.install(app.job_queue)
+        alerts.install(app.job_queue)
         if settings.public_url:
             app.job_queue.run_repeating(
                 _keepalive, interval=KEEPALIVE_INTERVAL, first=KEEPALIVE_INTERVAL
