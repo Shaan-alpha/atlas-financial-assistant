@@ -1,0 +1,45 @@
+# Render Blueprint. Provisions the database and the bot together, so a single
+# "New Blueprint Instance" gets Atlas running with persistence already wired.
+
+databases:
+  - name: atlas-db
+    plan: free
+    databaseName: atlas
+    user: atlas
+
+services:
+  - type: web
+    name: atlas-financial-assistant
+    runtime: python
+    plan: free
+    region: singapore
+    buildCommand: pip install -e .
+    startCommand: python -m atlas.main
+    healthCheckPath: /
+    envVars:
+      - key: PYTHON_VERSION
+        value: "3.13.4"
+      - key: LOG_LEVEL
+        value: INFO
+
+      # Postgres, wired automatically from the database above. Without it Atlas
+      # falls back to SQLite, which a free web service wipes on every redeploy —
+      # taking every user's onboarding and memory with it.
+      - key: DATABASE_URL
+        fromDatabase:
+          name: atlas-db
+          property: connectionString
+
+      # Secrets: entered in the Render dashboard, never committed.
+      - key: TELEGRAM_TOKEN
+        sync: false
+      - key: GEMINI_API_KEY
+        sync: false
+      - key: GROQ_API_KEY
+        sync: false
+
+      # This service's own public URL, e.g. https://atlas-financial-assistant.onrender.com
+      # Enables the 10-minute self-ping that stops the free tier sleeping, so a
+      # judge never waits ~50s on a cold start.
+      - key: PUBLIC_URL
+        sync: false
