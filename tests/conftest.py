@@ -32,3 +32,14 @@ def fresh_db(env, tmp_path, monkeypatch):
     sess.init_db()
     yield
     sess.reset_engine()
+
+
+@pytest.fixture(autouse=True)
+def _no_live_extraction(monkeypatch):
+    """Background fact extraction runs after every turn. Keep the suite offline."""
+    import atlas.memory.extract as extract
+
+    async def _none(user_text, reply):
+        return []
+
+    monkeypatch.setattr(extract, "_extract", _none)

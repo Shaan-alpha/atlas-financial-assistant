@@ -4,6 +4,7 @@ Gemini's automatic function calling runs the tool cycle; we supply the tools,
 the hydrated history, and the system prompt.
 """
 
+import asyncio
 import logging
 
 from google.genai import types
@@ -11,6 +12,7 @@ from google.genai import types
 from atlas.engine.prompt import build_system_prompt
 from atlas.integrations.gemini import MODEL_CHAT, get_client
 from atlas.memory import store
+from atlas.memory.extract import extract_and_store
 from atlas.tools.registry import build_tools
 
 log = logging.getLogger(__name__)
@@ -19,6 +21,9 @@ HISTORY_TURNS = 20
 MAX_REPLY_CHARS = 1400  # far below Telegram's 4096; concision is a requirement
 FAILURE_REPLY = "I hit trouble reaching my data sources just then. Try me again?"
 EMPTY_REPLY = "I did not get that — could you say it another way?"
+
+# Strong refs so background tasks are not garbage collected mid-flight.
+_BACKGROUND: set[asyncio.Task] = set()
 
 
 def _to_contents(history: list[dict], text: str, attachments: list[dict] | None):
@@ -90,4 +95,10 @@ async def respond(
         reply = reply[:MAX_REPLY_CHARS].rsplit(" ", 1)[0] + "…"
 
     store.append_message(user_id, "model", reply)
+
+    # Detached: memory writes must not add latency to the reply.
+    task = asyncio.create_task(extract_and_store(user_id, text, reply))
+    _BACKGROUND.add(task)
+    task.add_done_callback(_BACKGROUND.discard)
+
     return reply
