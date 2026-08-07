@@ -12,3 +12,4 @@ credentials.json
 .pytest_cache/
 .ruff_cache/
 .venv/
+*.egg-info/
