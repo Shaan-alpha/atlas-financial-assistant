@@ -14,6 +14,7 @@ from telegram.ext import ContextTypes
 
 from atlas.engine.conversation import respond
 from atlas.ingress.normalize import caption_or_default
+from atlas.ingress.reply import send_reply
 from atlas.integrations.gemini import get_client
 from atlas.integrations.groq import transcribe
 from atlas.memory import store
@@ -41,16 +42,16 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     uid = _user_id(update)
     profile = store.profile_snapshot(uid)
     if profile["onboarding_state"] == "new":
-        await update.message.reply_text(GREETING)
+        await send_reply(update.message, GREETING)
     else:
         await _typing(update)
-        await update.message.reply_text(await respond(uid, "I'm back."))
+        await send_reply(update.message, await respond(uid, "I'm back."))
 
 
 async def on_text(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     uid = _user_id(update)
     await _typing(update)
-    await update.message.reply_text(await respond(uid, update.message.text))
+    await send_reply(update.message, await respond(uid, update.message.text))
 
 
 async def on_voice(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -65,10 +66,10 @@ async def on_voice(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     # stall every other user's turn.
     text = await asyncio.to_thread(transcribe, audio)
     if text is None:
-        await update.message.reply_text(VOICE_FAILED)
+        await send_reply(update.message, VOICE_FAILED)
         return
 
-    await update.message.reply_text(await respond(uid, text))
+    await send_reply(update.message, await respond(uid, text))
 
 
 async def on_photo(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -81,7 +82,7 @@ async def on_photo(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
 
     prompt = caption_or_default(update.message.caption, "image")
     attachments = [{"kind": "image", "bytes": image, "mime": "image/jpeg"}]
-    await update.message.reply_text(await respond(uid, prompt, attachments))
+    await send_reply(update.message, await respond(uid, prompt, attachments))
 
 
 async def on_document(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -107,9 +108,9 @@ async def on_document(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
         )
     except Exception:
         log.exception("file upload failed")
-        await update.message.reply_text("I couldn't read that file. Try resending it?")
+        await send_reply(update.message, "I couldn't read that file. Try resending it?")
         return
 
     prompt = caption_or_default(update.message.caption, "document")
     attachments = [{"kind": "file", "uri": uploaded.uri, "mime": mime}]
-    await update.message.reply_text(await respond(uid, prompt, attachments))
+    await send_reply(update.message, await respond(uid, prompt, attachments))

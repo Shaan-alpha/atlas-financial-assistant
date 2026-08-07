@@ -1,4 +1,4 @@
-from atlas.db.models import MemoryFact, Message, User
+from atlas.db.models import MemoryFact, Message, User, WatchlistItem
 from atlas.db.session import session_scope
 
 PROFILE_FIELDS = {"name", "role", "timezone", "briefing_time", "onboarding_state"}
@@ -79,6 +79,49 @@ def forget(user_id: int, needle: str) -> int:
         for row in rows:
             s.delete(row)
         return len(rows)
+
+
+def add_watchlist(user_id: int, symbol: str, company: str | None = None) -> bool:
+    """Add a symbol to the watchlist. Returns False if it was already there."""
+    ticker = symbol.strip().upper()
+    if not ticker:
+        return False
+    with session_scope() as s:
+        existing = (
+            s.query(WatchlistItem)
+            .filter_by(user_id=user_id, symbol=ticker)
+            .one_or_none()
+        )
+        if existing is not None:
+            return False
+        s.add(WatchlistItem(user_id=user_id, symbol=ticker, company=company))
+        return True
+
+
+def remove_watchlist(user_id: int, symbol: str) -> bool:
+    """Remove a symbol from the watchlist. Returns False if it was not there."""
+    ticker = symbol.strip().upper()
+    with session_scope() as s:
+        row = (
+            s.query(WatchlistItem)
+            .filter_by(user_id=user_id, symbol=ticker)
+            .one_or_none()
+        )
+        if row is None:
+            return False
+        s.delete(row)
+        return True
+
+
+def get_watchlist(user_id: int) -> list[dict]:
+    with session_scope() as s:
+        rows = (
+            s.query(WatchlistItem)
+            .filter_by(user_id=user_id)
+            .order_by(WatchlistItem.id)
+            .all()
+        )
+        return [{"symbol": r.symbol, "company": r.company} for r in rows]
 
 
 def append_message(user_id: int, role: str, content: str) -> None:

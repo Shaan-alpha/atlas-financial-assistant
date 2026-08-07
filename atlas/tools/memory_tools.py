@@ -31,7 +31,48 @@ def make_memory_tools(user_id: int) -> list[Callable]:
         personalized answers.
         """
         return ok(
-            {"profile": store.profile_snapshot(user_id), "facts": store.all_facts(user_id)},
+            {
+                "profile": store.profile_snapshot(user_id),
+                "facts": store.all_facts(user_id),
+                "watchlist": store.get_watchlist(user_id),
+            },
+            source=SOURCE,
+        )
+
+    def add_to_watchlist(symbol: str, company: str = "") -> dict:
+        """Start monitoring a security for the user.
+
+        Use whenever the user says they follow, hold, track, or care about a company.
+        Watchlist entries drive their daily briefing.
+
+        Args:
+            symbol: Ticker symbol, for example "NVDA".
+            company: Optional company name for display.
+        """
+        added = store.add_watchlist(user_id, symbol, company or None)
+        return ok(
+            {
+                "symbol": symbol.strip().upper(),
+                "added": added,
+                "already_present": not added,
+                "watchlist": store.get_watchlist(user_id),
+            },
+            source=SOURCE,
+        )
+
+    def remove_from_watchlist(symbol: str) -> dict:
+        """Stop monitoring a security for the user.
+
+        Args:
+            symbol: Ticker symbol to drop, for example "TSLA".
+        """
+        removed = store.remove_watchlist(user_id, symbol)
+        return ok(
+            {
+                "symbol": symbol.strip().upper(),
+                "removed": removed,
+                "watchlist": store.get_watchlist(user_id),
+            },
             source=SOURCE,
         )
 
@@ -44,4 +85,4 @@ def make_memory_tools(user_id: int) -> list[Callable]:
         removed = store.forget(user_id, topic)
         return ok({"removed": removed, "topic": topic}, source=SOURCE)
 
-    return [remember, recall, forget_about]
+    return [remember, recall, forget_about, add_to_watchlist, remove_from_watchlist]

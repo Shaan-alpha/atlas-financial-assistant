@@ -15,6 +15,9 @@ def test_registry_exposes_every_expected_tool():
         "get_quote",
         "get_fundamentals",
         "compare_companies",
+        "market_overview",
+        "get_price_history",
+        "get_earnings_info",
         "get_recent_filings",
         "search_financial_news",
         "analyze_sheet",
@@ -22,6 +25,8 @@ def test_registry_exposes_every_expected_tool():
         "remember",
         "recall",
         "forget_about",
+        "add_to_watchlist",
+        "remove_from_watchlist",
     }
 
 

@@ -27,7 +27,7 @@ async def test_respond_persists_both_sides_of_the_turn(monkeypatch):
     assert "231.40" in reply
     history = store.recent_messages(uid)
     assert [m["role"] for m in history] == ["user", "model"]
-    assert captured["tool_count"] == 10
+    assert captured["tool_count"] == 15
 
 
 async def test_history_is_passed_to_the_model(monkeypatch):
