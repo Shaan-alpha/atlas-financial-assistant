@@ -7,6 +7,7 @@ from atlas.config import get_settings
 from atlas.db.session import init_db
 from atlas.health import ping, start_health_server
 from atlas.ingress import handlers
+from atlas.proactive import scheduler
 
 log = logging.getLogger(__name__)
 
@@ -46,11 +47,15 @@ def main() -> None:
     app.add_handler(MessageHandler(filters.PHOTO, handlers.on_photo))
     app.add_handler(MessageHandler(filters.Document.ALL, handlers.on_document))
 
-    if settings.public_url and app.job_queue is not None:
-        app.job_queue.run_repeating(
-            _keepalive, interval=KEEPALIVE_INTERVAL, first=KEEPALIVE_INTERVAL
-        )
-        log.info("keep-alive scheduled every %s", KEEPALIVE_INTERVAL)
+    if app.job_queue is not None:
+        scheduler.install(app.job_queue)
+        if settings.public_url:
+            app.job_queue.run_repeating(
+                _keepalive, interval=KEEPALIVE_INTERVAL, first=KEEPALIVE_INTERVAL
+            )
+            log.info("keep-alive scheduled every %s", KEEPALIVE_INTERVAL)
+    else:
+        log.warning("no job queue: briefings and keep-alive are disabled")
 
     log.info("Atlas is up")
     app.run_polling(drop_pending_updates=False)

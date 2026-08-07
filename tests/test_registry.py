@@ -25,6 +25,7 @@ def test_registry_exposes_every_expected_tool():
         "remember",
         "recall",
         "forget_about",
+        "update_profile",
         "add_to_watchlist",
         "remove_from_watchlist",
     }

@@ -55,6 +55,21 @@ class WatchlistItem(Base):
     created_at: Mapped[datetime] = mapped_column(DateTime, default=_utcnow)
 
 
+class SentSignal(Base):
+    """Ledger of what a user has already been shown.
+
+    Without this a briefing re-surfaces yesterday's filing every morning, which
+    is exactly the noise the brief says to avoid.
+    """
+
+    __tablename__ = "sent_signals"
+
+    id: Mapped[int] = mapped_column(primary_key=True)
+    user_id: Mapped[int] = mapped_column(ForeignKey("users.id"), index=True)
+    signal_key: Mapped[str] = mapped_column(String(255), index=True)
+    created_at: Mapped[datetime] = mapped_column(DateTime, default=_utcnow)
+
+
 class Document(Base):
     __tablename__ = "documents"
 

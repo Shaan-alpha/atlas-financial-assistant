@@ -3,12 +3,24 @@
 The model never supplies a user id, so it cannot reach another user's data.
 """
 
+import re
 from collections.abc import Callable
+from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 from atlas.memory import store
-from atlas.tools.result import ok
+from atlas.tools.result import err, ok
 
 SOURCE = "atlas-memory"
+
+_VALID_TIME = re.compile(r"^([01]\d|2[0-3]):[0-5]\d$")
+
+
+def _is_known_timezone(name: str) -> bool:
+    try:
+        ZoneInfo(name)
+    except (ZoneInfoNotFoundError, ValueError):
+        return False
+    return True
 
 
 def make_memory_tools(user_id: int) -> list[Callable]:
@@ -38,6 +50,42 @@ def make_memory_tools(user_id: int) -> list[Callable]:
             },
             source=SOURCE,
         )
+
+    def update_profile(
+        role: str = "", timezone: str = "", briefing_time: str = ""
+    ) -> dict:
+        """Save the user's role, timezone, or preferred daily briefing time.
+
+        Call this during onboarding as soon as they tell you any of these, and
+        whenever they change one. Briefings only run for users who have set a time.
+
+        Args:
+            role: How they describe their work, e.g. "equity analyst", "founder".
+            timezone: IANA name, e.g. "Asia/Kolkata". Ask if you are unsure.
+            briefing_time: 24-hour local time as "HH:MM", e.g. "08:30".
+        """
+        if briefing_time and not _VALID_TIME.match(briefing_time):
+            return err("bad_time", "Briefing time must look like '08:30' on a 24h clock.")
+        if timezone and not _is_known_timezone(timezone):
+            return err("bad_timezone", f"'{timezone}' is not a recognised IANA timezone.")
+
+        fields = {
+            k: v
+            for k, v in {
+                "role": role,
+                "timezone": timezone,
+                "briefing_time": briefing_time,
+            }.items()
+            if v
+        }
+        if not fields:
+            return err("nothing_to_update", "Give at least one field to update.")
+
+        store.set_profile(user_id, **fields)
+        # Onboarding is done once we know their role.
+        if fields.get("role"):
+            store.set_profile(user_id, onboarding_state="done")
+        return ok({"updated": fields, "profile": store.profile_snapshot(user_id)}, source=SOURCE)
 
     def add_to_watchlist(symbol: str, company: str = "") -> dict:
         """Start monitoring a security for the user.
@@ -85,4 +133,11 @@ def make_memory_tools(user_id: int) -> list[Callable]:
         removed = store.forget(user_id, topic)
         return ok({"removed": removed, "topic": topic}, source=SOURCE)
 
-    return [remember, recall, forget_about, add_to_watchlist, remove_from_watchlist]
+    return [
+        remember,
+        recall,
+        forget_about,
+        update_profile,
+        add_to_watchlist,
+        remove_from_watchlist,
+    ]

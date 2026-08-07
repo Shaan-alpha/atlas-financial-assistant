@@ -1,4 +1,4 @@
-from atlas.db.models import MemoryFact, Message, User, WatchlistItem
+from atlas.db.models import MemoryFact, Message, SentSignal, User, WatchlistItem
 from atlas.db.session import session_scope
 
 PROFILE_FIELDS = {"name", "role", "timezone", "briefing_time", "onboarding_state"}
@@ -122,6 +122,42 @@ def get_watchlist(user_id: int) -> list[dict]:
             .all()
         )
         return [{"symbol": r.symbol, "company": r.company} for r in rows]
+
+
+def users_with_briefings() -> list[dict]:
+    """Everyone who has asked for a daily briefing, for the scheduler."""
+    with session_scope() as s:
+        rows = s.query(User).filter(User.briefing_time.isnot(None)).all()
+        return [
+            {
+                "user_id": r.id,
+                "telegram_id": r.telegram_id,
+                "briefing_time": r.briefing_time,
+                "timezone": r.timezone,
+            }
+            for r in rows
+        ]
+
+
+def filter_unsent(user_id: int, keys: list[str]) -> list[str]:
+    """Return only the keys this user has not already been shown."""
+    if not keys:
+        return []
+    with session_scope() as s:
+        seen = {
+            row.signal_key
+            for row in s.query(SentSignal)
+            .filter(SentSignal.user_id == user_id)
+            .filter(SentSignal.signal_key.in_(keys))
+            .all()
+        }
+    return [k for k in keys if k not in seen]
+
+
+def mark_sent(user_id: int, keys: list[str]) -> None:
+    with session_scope() as s:
+        for key in keys:
+            s.add(SentSignal(user_id=user_id, signal_key=key))
 
 
 def append_message(user_id: int, role: str, content: str) -> None:
