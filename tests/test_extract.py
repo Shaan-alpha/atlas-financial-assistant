@@ -26,7 +26,7 @@ async def test_extraction_failure_is_swallowed(monkeypatch):
     monkeypatch.setattr(extract, "_extract", _boom)
     uid = store.get_or_create_user(2, "Shaan")
 
-    assert await extract.extract_and_store(uid, "hi", "hello") == 0
+    assert await extract.extract_and_store(uid, "I run a macro book", "Noted.") == 0
 
 
 async def test_malformed_entries_are_skipped(monkeypatch):
@@ -40,4 +40,20 @@ async def test_malformed_entries_are_skipped(monkeypatch):
     monkeypatch.setattr(extract, "_extract", _messy)
     uid = store.get_or_create_user(3, "Shaan")
 
-    assert await extract.extract_and_store(uid, "t", "r") == 1
+    assert await extract.extract_and_store(uid, "I run a long/short book", "r") == 1
+
+
+async def test_throwaway_turns_never_reach_the_model(monkeypatch):
+    """The gate must short-circuit before spending a request on quota."""
+    called = False
+
+    async def _spy(user_text, reply):
+        nonlocal called
+        called = True
+        return []
+
+    monkeypatch.setattr(extract, "_extract", _spy)
+    uid = store.get_or_create_user(4, "Shaan")
+
+    assert await extract.extract_and_store(uid, "nvda price?", "It's $222.") == 0
+    assert called is False

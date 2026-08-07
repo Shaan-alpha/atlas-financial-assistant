@@ -13,3 +13,4 @@ credentials.json
 .ruff_cache/
 .venv/
 *.egg-info/
+smoke.db
