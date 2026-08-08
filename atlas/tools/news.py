@@ -4,23 +4,41 @@ Grounding is used rather than a headline API because it returns synthesized answ
 with real citations, which is what the accuracy requirement actually needs.
 """
 
+import logging
+
 from google.genai import types
 
-from atlas.integrations.gemini import MODEL_GROUNDED, get_client
+from atlas.integrations.gemini import GROUNDED_CHAIN, get_client, is_rate_limited
 from atlas.tools.result import err, ok
+
+log = logging.getLogger(__name__)
 
 SOURCE = "Google Search (grounded)"
 
 
 def _generate_grounded(query: str):
-    """Network seam. Tests monkeypatch this."""
-    return get_client().models.generate_content(
-        model=MODEL_GROUNDED,
-        contents=query,
-        config=types.GenerateContentConfig(
-            tools=[types.Tool(google_search=types.GoogleSearch())]
-        ),
-    )
+    """Network seam. Tests monkeypatch this.
+
+    Free-tier quota is per model, so an exhausted preview model does not mean the
+    next one is also spent. This is the same failover the conversation engine
+    uses; without it a single quota wall silently removes live news entirely.
+    """
+    last: Exception | None = None
+    for model in GROUNDED_CHAIN:
+        try:
+            return get_client().models.generate_content(
+                model=model,
+                contents=query,
+                config=types.GenerateContentConfig(
+                    tools=[types.Tool(google_search=types.GoogleSearch())]
+                ),
+            )
+        except Exception as exc:
+            last = exc
+            if not is_rate_limited(exc):
+                raise
+            log.warning("grounded model %s rate limited, trying next", model)
+    raise last if last is not None else RuntimeError("no grounded model configured")
 
 
 def _extract_citations(response) -> list[dict]:

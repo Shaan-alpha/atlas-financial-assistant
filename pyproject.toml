@@ -22,7 +22,7 @@ dependencies = [
 ]
 
 [project.optional-dependencies]
-dev = ["pytest>=8.0", "pytest-asyncio>=0.23"]
+dev = ["pytest>=8.0", "pytest-asyncio>=0.23", "fpdf2>=2.8"]
 
 [tool.setuptools.packages.find]
 # Pinned rather than auto-discovered: this is a flat layout, and setuptools
