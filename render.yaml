@@ -9,14 +9,14 @@ databases:
     # MUST match the web service region below. Render's internal database host
     # (dpg-...-a, with no domain suffix) only resolves inside its own region, so
     # a mismatch fails with "Name or service not known" at connect time.
-    region: oregon
+    region: singapore
 
 services:
   - type: web
     name: atlas-financial-assistant
     runtime: python
     plan: free
-    region: oregon  # must equal the database region above
+    region: singapore  # must equal the database region above
     buildCommand: pip install -e .
     startCommand: python -m atlas.main
     healthCheckPath: /
