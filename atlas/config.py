@@ -16,6 +16,11 @@ class Settings:
     log_level: str
     port: int
     public_url: str | None
+    # Optional market-data providers. Each is tried in turn; absent keys are
+    # skipped rather than erroring, so the bot runs with none of them set.
+    finnhub_api_key: str | None
+    fmp_api_key: str | None
+    alphavantage_api_key: str | None
 
 
 def _required(name: str) -> str:
@@ -46,4 +51,7 @@ def get_settings() -> Settings:
         log_level=os.environ.get("LOG_LEVEL", "INFO"),
         port=int(os.environ.get("PORT", "8080")),
         public_url=os.environ.get("PUBLIC_URL") or None,
+        finnhub_api_key=os.environ.get("FINNHUB_API_KEY") or None,
+        fmp_api_key=os.environ.get("FMP_API_KEY") or None,
+        alphavantage_api_key=os.environ.get("ALPHAVANTAGE_API_KEY") or None,
     )

@@ -15,8 +15,16 @@ def _price_of(info: dict) -> float | None:
     return info.get("currentPrice") or info.get("regularMarketPrice")
 
 
+def _fetch_quote(symbol: str) -> dict | None:
+    """Normalized quote via the provider chain. Tests monkeypatch this."""
+    from atlas.integrations import marketdata
+
+    return marketdata.fetch_quote(symbol)
+
+
 def _fetch_info(symbol: str) -> dict | None:
-    """Network seam. Tests monkeypatch this so the suite stays offline."""
+    """Full fundamentals. Only yfinance carries these, so it may be unavailable
+    on cloud hosts; quotes deliberately do not depend on it."""
     import yfinance as yf
 
     try:
@@ -77,10 +85,11 @@ def get_quote(symbol: str) -> dict:
     Args:
         symbol: Ticker symbol, for example "AAPL", "MSFT", or an index like "^GSPC".
     """
-    info = _fetch_info(symbol)
-    if info is None:
+    quote = _fetch_quote(symbol)
+    if quote is None:
         return err("no_such_symbol", f"No listed security matches '{symbol}'.")
-    return ok(_quote_from_info(symbol, info), source=SOURCE)
+    # Attribute to whichever provider actually answered, not a fixed name.
+    return ok(quote, source=quote.get("source", SOURCE))
 
 
 def get_fundamentals(symbol: str) -> dict:
@@ -140,10 +149,9 @@ def market_overview() -> dict:
     """
     rows = []
     for symbol, name in INDICES.items():
-        info = _fetch_info(symbol)
-        if info is None:
+        quote = _fetch_quote(symbol)
+        if quote is None:
             continue
-        quote = _quote_from_info(symbol, info)
         quote["name"] = name
         rows.append(quote)
 

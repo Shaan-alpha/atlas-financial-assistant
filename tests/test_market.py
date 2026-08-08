@@ -32,11 +32,30 @@ FAKE = {
 
 
 def _fake_fetch(symbol: str) -> dict | None:
+    """Fundamentals seam (yfinance-shaped)."""
     return FAKE.get(symbol.upper())
 
 
+def _fake_quote(symbol: str) -> dict | None:
+    """Provider-chain seam (already normalized)."""
+    info = FAKE.get(symbol.upper())
+    if info is None:
+        return None
+    price = info.get("currentPrice") or info.get("regularMarketPrice")
+    prev = info.get("previousClose")
+    return {
+        "symbol": symbol.upper(),
+        "name": info.get("shortName"),
+        "price": price,
+        "previous_close": prev,
+        "change_pct": ((price - prev) / prev * 100) if price and prev else None,
+        "currency": info.get("currency", "USD"),
+        "source": "TestProvider",
+    }
+
+
 def test_get_quote_computes_change(monkeypatch):
-    monkeypatch.setattr(market, "_fetch_info", _fake_fetch)
+    monkeypatch.setattr(market, "_fetch_quote", _fake_quote)
 
     r = market.get_quote("aapl")
 
@@ -44,11 +63,11 @@ def test_get_quote_computes_change(monkeypatch):
     assert r["data"]["symbol"] == "AAPL"
     assert r["data"]["price"] == 231.4
     assert round(r["data"]["change_pct"], 2) == 1.49
-    assert r["source"] == "yfinance"
+    assert r["source"] == "TestProvider"
 
 
 def test_get_quote_unknown_symbol_returns_error_not_exception(monkeypatch):
-    monkeypatch.setattr(market, "_fetch_info", _fake_fetch)
+    monkeypatch.setattr(market, "_fetch_quote", _fake_quote)
 
     r = market.get_quote("XYZQ")
 
@@ -58,7 +77,7 @@ def test_get_quote_unknown_symbol_returns_error_not_exception(monkeypatch):
 
 def test_get_quote_handles_an_index(monkeypatch):
     """Indices leave currentPrice unset — regularMarketPrice must be used."""
-    monkeypatch.setattr(market, "_fetch_info", _fake_fetch)
+    monkeypatch.setattr(market, "_fetch_quote", _fake_quote)
 
     r = market.get_quote("^GSPC")
 
@@ -84,7 +103,7 @@ def test_compare_companies_requires_at_least_two():
 
 
 def test_market_overview_returns_the_three_major_indices(monkeypatch):
-    monkeypatch.setattr(market, "_fetch_info", _fake_fetch)
+    monkeypatch.setattr(market, "_fetch_quote", _fake_quote)
 
     r = market.market_overview()
 

@@ -42,6 +42,16 @@ services:
       - key: GROQ_API_KEY
         sync: false
 
+      # Market-data providers, tried in this order. yfinance alone is not enough:
+      # Yahoo blocks datacenter IPs, so it works locally and fails in production.
+      # Any subset may be set; missing keys are skipped, not errors.
+      - key: FINNHUB_API_KEY
+        sync: false
+      - key: FMP_API_KEY
+        sync: false
+      - key: ALPHAVANTAGE_API_KEY
+        sync: false
+
       # This service's own public URL, e.g. https://atlas-financial-assistant.onrender.com
       # Enables the 10-minute self-ping that stops the free tier sleeping, so a
       # judge never waits ~50s on a cold start.

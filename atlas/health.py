@@ -8,6 +8,7 @@ reads as broken. Two pieces solve it:
   2. A periodic self-request so the service never goes idle in the first place.
 """
 
+import json
 import logging
 import threading
 from http.server import BaseHTTPRequestHandler, HTTPServer
@@ -19,10 +20,30 @@ log = logging.getLogger(__name__)
 
 class _HealthHandler(BaseHTTPRequestHandler):
     def do_GET(self):
+        if self.path.startswith("/diag"):
+            self._diag()
+            return
         self.send_response(200)
         self.send_header("Content-Type", "text/plain")
         self.end_headers()
         self.wfile.write(b"atlas ok")
+
+    def _diag(self):
+        """Report which market-data providers work FROM THIS HOST.
+
+        Provider availability depends on the caller's IP: Yahoo blocks datacenter
+        ranges, so a laptop and a cloud host give different answers. This can only
+        be measured from where the bot actually runs.
+        """
+        from atlas.integrations import marketdata
+
+        payload = {"providers": marketdata.probe("AAPL")}
+        body = json.dumps(payload, indent=2).encode()
+        self.send_response(200)
+        self.send_header("Content-Type", "application/json")
+        self.send_header("Content-Length", str(len(body)))
+        self.end_headers()
+        self.wfile.write(body)
 
     def log_message(self, *args):
         """Silence per-request logging; the self-ping would flood the log."""
