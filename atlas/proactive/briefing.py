@@ -52,6 +52,36 @@ async def build(user_id: int, tz_name: str) -> str | None:
     return verdict["brief"]
 
 
+def build_now(user_id: int, tz_name: str) -> dict:
+    """Build a briefing because the user asked for one, right now.
+
+    Differs from the scheduled path in two ways, both deliberate:
+
+    - It always returns something to say. Silence is the correct answer to
+      "should I interrupt them?", but not to "tell me what's going on".
+    - It does not mark signals as sent. The dedupe ledger exists so the assistant
+      never *interrupts* twice with the same item; a pull is not an interruption,
+      and consuming the ledger here would silence tomorrow's briefing.
+    """
+    today = local_today(tz_name)
+
+    signals = gather.gather(user_id, today)
+    if not signals:
+        return {"has_news": False, "brief": None, "signals_considered": 0}
+
+    verdict = salience.decide_sync(
+        store.profile_snapshot(user_id),
+        store.all_facts(user_id),
+        signals,
+        gather.market_context(),
+    )
+    return {
+        "has_news": verdict["send"],
+        "brief": verdict["brief"] or None,
+        "signals_considered": len(signals),
+    }
+
+
 async def send_to(bot, user_id: int, telegram_id: int, tz_name: str) -> bool:
     """Build and deliver. Returns whether anything was actually sent."""
     try:

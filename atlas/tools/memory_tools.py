@@ -137,6 +137,24 @@ def make_memory_tools(user_id: int) -> list[Callable]:
         removed = store.forget(user_id, topic)
         return ok({"removed": removed, "topic": topic}, source=SOURCE)
 
+    def brief_me_now() -> dict:
+        """Compile the user's market briefing on demand, from their watchlist.
+
+        Use when they ask for their briefing, what they missed, what's happening
+        with their names, or to catch them up.
+
+        When has_news is false, tell them plainly that nothing on their watchlist
+        is worth their attention right now. Do not manufacture something to say.
+
+        Args:
+            None.
+        """
+        from atlas.proactive import briefing
+
+        profile = store.profile_snapshot(user_id)
+        result = briefing.build_now(user_id, profile.get("timezone") or "UTC")
+        return ok(result, source=SOURCE)
+
     def create_alert(
         description: str, symbol: str, kind: str, threshold: float
     ) -> dict:
@@ -186,6 +204,7 @@ def make_memory_tools(user_id: int) -> list[Callable]:
         update_profile,
         add_to_watchlist,
         remove_from_watchlist,
+        brief_me_now,
         create_alert,
         list_alerts,
         cancel_alert,

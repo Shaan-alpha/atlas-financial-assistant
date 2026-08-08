@@ -15,6 +15,7 @@ requests per minute per model, and a second call per user per morning buys
 nothing the first cannot do.
 """
 
+import asyncio
 import json
 import logging
 
@@ -23,6 +24,8 @@ from google.genai import types
 from atlas.integrations.gemini import EXTRACT_CHAIN, get_client, is_rate_limited
 
 log = logging.getLogger(__name__)
+
+SILENT = {"send": False, "brief": "", "used_keys": []}
 
 INSTRUCTION = """\
 You decide whether a financial assistant should interrupt its user this morning,
@@ -61,11 +64,13 @@ def _payload(profile: dict, facts: list[dict], signals: list[dict], context) -> 
     )
 
 
-async def _decide(prompt: str) -> dict:
+def _decide_sync(prompt: str) -> dict:
+    """The actual model call. Synchronous so it can serve both the scheduled
+    briefing and the on-demand tool, which runs inside a sync tool call."""
     last: Exception | None = None
     for model in EXTRACT_CHAIN:
         try:
-            response = await get_client().aio.models.generate_content(
+            response = get_client().models.generate_content(
                 model=model,
                 contents=prompt,
                 config=types.GenerateContentConfig(
@@ -81,28 +86,49 @@ async def _decide(prompt: str) -> dict:
     raise last if last is not None else RuntimeError("no salience model configured")
 
 
+async def _decide(prompt: str) -> dict:
+    """Async wrapper. Off-thread so the scheduled path never blocks the loop."""
+    return await asyncio.to_thread(_decide_sync, prompt)
+
+
+def _verdict_from(raw: dict, signals: list[dict]) -> dict:
+    """Shared interpretation of the model's answer, used by both paths."""
+    brief = (raw.get("brief") or "").strip()
+    if not raw.get("send") or not brief:
+        return SILENT
+    return {
+        "send": True,
+        "brief": brief,
+        "used_keys": raw.get("used_keys") or [s["key"] for s in signals],
+    }
+
+
+def decide_sync(
+    profile: dict, facts: list[dict], signals: list[dict], context: dict | None
+) -> dict:
+    """Synchronous gate, for the on-demand briefing tool."""
+    if not signals:
+        return SILENT
+    try:
+        raw = _decide_sync(_payload(profile, facts, signals, context))
+    except Exception:
+        log.exception("salience gate failed; staying silent")
+        return SILENT
+    return _verdict_from(raw, signals)
+
+
 async def decide(
     profile: dict, facts: list[dict], signals: list[dict], context: dict | None
 ) -> dict:
     """Return {"send": bool, "brief": str, "used_keys": list[str]}."""
-    silent = {"send": False, "brief": "", "used_keys": []}
-
     # Nothing happened. Do not spend a request confirming that.
     if not signals:
-        return silent
+        return SILENT
 
     try:
-        verdict = await _decide(_payload(profile, facts, signals, context))
+        raw = await _decide(_payload(profile, facts, signals, context))
     except Exception:
         log.exception("salience gate failed; staying silent")
-        return silent
+        return SILENT
 
-    brief = (verdict.get("brief") or "").strip()
-    if not verdict.get("send") or not brief:
-        return silent
-
-    return {
-        "send": True,
-        "brief": brief,
-        "used_keys": verdict.get("used_keys") or [s["key"] for s in signals],
-    }
+    return _verdict_from(raw, signals)

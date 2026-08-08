@@ -31,6 +31,7 @@ def test_registry_exposes_every_expected_tool():
         "create_alert",
         "list_alerts",
         "cancel_alert",
+        "brief_me_now",
     }
 
 

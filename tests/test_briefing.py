@@ -210,3 +210,77 @@ def test_utc_conversion_shifts_by_the_offset():
     """08:30 in Kolkata is 03:00 UTC."""
     converted = briefing.utc_time_for("08:30", "Asia/Kolkata")
     assert (converted.hour, converted.minute) == (3, 0)
+
+
+# ------------------------------------------------------- on-demand briefing
+#
+# Silence is the right answer to "should I interrupt them?" but the wrong answer
+# to "tell me what's going on". The pull path therefore always says something.
+
+
+def test_on_demand_reports_when_there_is_nothing(monkeypatch):
+    uid = store.get_or_create_user(20, "Shaan")
+    monkeypatch.setattr(briefing, "local_today", lambda tz: TODAY)
+    monkeypatch.setattr(briefing.gather, "gather", lambda u, d: [])
+
+    result = briefing.build_now(uid, "UTC")
+
+    assert result["has_news"] is False
+    assert result["brief"] is None
+    assert result["signals_considered"] == 0
+
+
+def test_on_demand_returns_the_brief_when_there_is_news(monkeypatch):
+    uid = store.get_or_create_user(21, "Shaan")
+    monkeypatch.setattr(briefing, "local_today", lambda tz: TODAY)
+    monkeypatch.setattr(
+        briefing.gather, "gather", lambda u, d: [{"key": "k", "summary": "NVDA +7%"}]
+    )
+    monkeypatch.setattr(briefing.gather, "market_context", lambda: None)
+    monkeypatch.setattr(
+        briefing.salience, "_decide_sync",
+        lambda p: {"send": True, "brief": "*NVDA* up 7%", "used_keys": ["k"]},
+    )
+
+    result = briefing.build_now(uid, "UTC")
+
+    assert result["has_news"] is True
+    assert result["brief"] == "*NVDA* up 7%"
+
+
+def test_on_demand_does_not_consume_the_dedupe_ledger(monkeypatch):
+    """A pull is not an interruption; consuming the ledger here would silence
+    the scheduled briefing that follows."""
+    uid = store.get_or_create_user(22, "Shaan")
+    store.add_watchlist(uid, "NVDA")
+    monkeypatch.setattr(briefing, "local_today", lambda tz: TODAY)
+    monkeypatch.setattr(gather.market, "get_quote", lambda s: _quote(s, 7.0))
+    monkeypatch.setattr(gather.filings, "get_recent_filings", _no_filings)
+    monkeypatch.setattr(gather.market, "get_earnings_info", _no_earnings)
+    monkeypatch.setattr(gather, "market_context", lambda: None)
+    monkeypatch.setattr(
+        briefing.salience, "_decide_sync",
+        lambda p: {"send": True, "brief": "b", "used_keys": []},
+    )
+
+    briefing.build_now(uid, "UTC")
+
+    # The scheduled path must still see the signal as unsent.
+    assert store.filter_unsent(uid, [f"move:NVDA:{TODAY}"]) == [f"move:NVDA:{TODAY}"]
+
+
+def test_silent_gate_still_reports_how_many_were_weighed(monkeypatch):
+    uid = store.get_or_create_user(23, "Shaan")
+    monkeypatch.setattr(briefing, "local_today", lambda tz: TODAY)
+    monkeypatch.setattr(
+        briefing.gather, "gather", lambda u, d: [{"key": "a"}, {"key": "b"}]
+    )
+    monkeypatch.setattr(briefing.gather, "market_context", lambda: None)
+    monkeypatch.setattr(
+        briefing.salience, "_decide_sync", lambda p: {"send": False, "brief": ""}
+    )
+
+    result = briefing.build_now(uid, "UTC")
+
+    assert result["has_news"] is False
+    assert result["signals_considered"] == 2

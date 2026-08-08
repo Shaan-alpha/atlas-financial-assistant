@@ -13,7 +13,9 @@ from atlas.proactive import briefing
 
 log = logging.getLogger(__name__)
 
-RESYNC_INTERVAL = dt.timedelta(minutes=30)
+# Short enough that a briefing time set mid-conversation takes effect the same
+# day rather than tomorrow. The resync is a database read, so it is cheap.
+RESYNC_INTERVAL = dt.timedelta(minutes=5)
 JOB_PREFIX = "briefing:"
 
 
