@@ -62,9 +62,13 @@ async def on_voice(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     handle = await context.bot.get_file(voice.file_id)
     audio = bytes(await handle.download_as_bytearray())
 
+    # Bias transcription toward the tickers this user actually follows; spoken
+    # ticker letters are the most error-prone thing in a finance voice note.
+    symbols = [item["symbol"] for item in store.get_watchlist(uid)]
+
     # transcribe() is a blocking HTTP call — off-thread so one voice note does not
     # stall every other user's turn.
-    text = await asyncio.to_thread(transcribe, audio)
+    text = await asyncio.to_thread(transcribe, audio, "voice.ogg", symbols)
     if text is None:
         await send_reply(update.message, VOICE_FAILED)
         return
