@@ -1,6 +1,7 @@
 import datetime as dt
 import logging
 
+from telegram.error import Conflict
 from telegram.ext import ApplicationBuilder, CommandHandler, MessageHandler, filters
 
 from atlas.config import get_settings
@@ -30,6 +31,30 @@ async def _keepalive(context) -> None:
     ping(get_settings().public_url)
 
 
+async def _on_error(update, context) -> None:
+    """Catch anything a handler let escape.
+
+    Without this, python-telegram-bot logs a full traceback and the user simply
+    never hears back. Redeploys also surface a transient getUpdates Conflict
+    while the old instance drains, which is noise rather than a fault.
+    """
+    error = context.error
+    if isinstance(error, Conflict):
+        log.warning("another instance is polling; this resolves on its own")
+        return
+
+    log.exception("unhandled error while processing an update", exc_info=error)
+
+    message = getattr(update, "effective_message", None)
+    if message is not None:
+        try:
+            await message.reply_text(
+                "Something went wrong on my side just then. Try me again?"
+            )
+        except Exception:
+            log.debug("could not deliver the error notice")
+
+
 def main() -> None:
     settings = get_settings()
     _configure_logging(settings.log_level)
@@ -49,6 +74,7 @@ def main() -> None:
     app.add_handler(MessageHandler(filters.VOICE | filters.AUDIO, handlers.on_voice))
     app.add_handler(MessageHandler(filters.PHOTO, handlers.on_photo))
     app.add_handler(MessageHandler(filters.Document.ALL, handlers.on_document))
+    app.add_error_handler(_on_error)
 
     if app.job_queue is not None:
         scheduler.install(app.job_queue)
