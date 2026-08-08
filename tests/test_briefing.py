@@ -239,7 +239,7 @@ def test_on_demand_returns_the_brief_when_there_is_news(monkeypatch):
     monkeypatch.setattr(briefing.gather, "market_context", lambda: None)
     monkeypatch.setattr(
         briefing.salience, "_decide_sync",
-        lambda p: {"send": True, "brief": "*NVDA* up 7%", "used_keys": ["k"]},
+        lambda p, i=None: {"send": True, "brief": "*NVDA* up 7%", "used_keys": ["k"]},
     )
 
     result = briefing.build_now(uid, "UTC")
@@ -260,7 +260,7 @@ def test_on_demand_does_not_consume_the_dedupe_ledger(monkeypatch):
     monkeypatch.setattr(gather, "market_context", lambda: None)
     monkeypatch.setattr(
         briefing.salience, "_decide_sync",
-        lambda p: {"send": True, "brief": "b", "used_keys": []},
+        lambda p, i=None: {"send": True, "brief": "b", "used_keys": []},
     )
 
     briefing.build_now(uid, "UTC")
@@ -277,10 +277,38 @@ def test_silent_gate_still_reports_how_many_were_weighed(monkeypatch):
     )
     monkeypatch.setattr(briefing.gather, "market_context", lambda: None)
     monkeypatch.setattr(
-        briefing.salience, "_decide_sync", lambda p: {"send": False, "brief": ""}
+        briefing.salience, "_decide_sync", lambda p, i=None: {"send": False, "brief": ""}
     )
 
     result = briefing.build_now(uid, "UTC")
 
     assert result["has_news"] is False
     assert result["signals_considered"] == 2
+
+
+def test_push_and_pull_use_different_instructions(monkeypatch):
+    """An unprompted ping must clear a higher bar than an explicit request."""
+    seen = {}
+
+    def _capture(prompt, instruction=salience.PUSH_INSTRUCTION):
+        seen.setdefault("instructions", []).append(instruction)
+        return {"send": False, "brief": ""}
+
+    monkeypatch.setattr(salience, "_decide_sync", _capture)
+    sig = [{"key": "k", "summary": "s"}]
+
+    salience.decide_sync({}, [], sig, None)
+
+    assert seen["instructions"] == [salience.PULL_INSTRUCTION]
+    assert "did not ask for this" in salience.PUSH_INSTRUCTION
+    assert "has just ASKED" in salience.PULL_INSTRUCTION
+
+
+def test_pull_instruction_forbids_silence_to_avoid_bothering():
+    assert "never to avoid bothering someone who asked" in salience.PULL_INSTRUCTION
+
+
+def test_both_instructions_share_the_formatting_body():
+    for text in (salience.PUSH_INSTRUCTION, salience.PULL_INSTRUCTION):
+        assert "why it matters" in text
+        assert "Never invent or estimate a figure" in text

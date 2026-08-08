@@ -27,17 +27,31 @@ log = logging.getLogger(__name__)
 
 SILENT = {"send": False, "brief": "", "used_keys": []}
 
-INSTRUCTION = """\
+PUSH_PREAMBLE = """\
 You decide whether a financial assistant should interrupt its user this morning,
 and if so, you write the briefing.
 
-BE STRICT. This person is busy. Only send when something genuinely changes what
-they might think or do today. Routine drift, small moves, and stale items are
-NOT worth an interruption. Silence is a good outcome and costs you nothing.
+BE STRICT. This person is busy and did not ask for this. Only send when something
+genuinely changes what they might think or do today. Routine drift, small moves,
+and stale items are NOT worth an interruption. Silence is a good outcome here and
+costs you nothing.
 
 If nothing clears that bar, return {"send": false, "brief": "", "used_keys": []}.
+"""
 
-If something does, write the briefing:
+PULL_PREAMBLE = """\
+The user has just ASKED what is happening with the names they follow. Answer them.
+
+The bar is different from an unprompted alert: they want to know, so report
+anything genuinely notable rather than only what would justify interrupting them.
+A meaningful move on a name they follow qualifies.
+
+Return {"send": false, ...} only when truly nothing has moved and there is no
+news at all — never to avoid bothering someone who asked.
+"""
+
+_BODY = """\
+If something is worth reporting, write the briefing:
 - Open with the single most important thing. No greeting, no preamble.
 - 6 lines maximum. One line per item.
 - EVERY item says why it matters to THIS user, given their role and interests.
@@ -47,6 +61,9 @@ If something does, write the briefing:
 
 Return JSON: {"send": bool, "brief": string, "used_keys": [signal keys used]}
 """
+
+PUSH_INSTRUCTION = PUSH_PREAMBLE + "\n" + _BODY
+PULL_INSTRUCTION = PULL_PREAMBLE + "\n" + _BODY
 
 
 def _payload(profile: dict, facts: list[dict], signals: list[dict], context) -> str:
@@ -64,7 +81,7 @@ def _payload(profile: dict, facts: list[dict], signals: list[dict], context) -> 
     )
 
 
-def _decide_sync(prompt: str) -> dict:
+def _decide_sync(prompt: str, instruction: str = PUSH_INSTRUCTION) -> dict:
     """The actual model call. Synchronous so it can serve both the scheduled
     briefing and the on-demand tool, which runs inside a sync tool call."""
     last: Exception | None = None
@@ -74,7 +91,7 @@ def _decide_sync(prompt: str) -> dict:
                 model=model,
                 contents=prompt,
                 config=types.GenerateContentConfig(
-                    system_instruction=INSTRUCTION,
+                    system_instruction=instruction,
                     response_mime_type="application/json",
                 ),
             )
@@ -86,9 +103,9 @@ def _decide_sync(prompt: str) -> dict:
     raise last if last is not None else RuntimeError("no salience model configured")
 
 
-async def _decide(prompt: str) -> dict:
+async def _decide(prompt: str, instruction: str = PUSH_INSTRUCTION) -> dict:
     """Async wrapper. Off-thread so the scheduled path never blocks the loop."""
-    return await asyncio.to_thread(_decide_sync, prompt)
+    return await asyncio.to_thread(_decide_sync, prompt, instruction)
 
 
 def _verdict_from(raw: dict, signals: list[dict]) -> dict:
@@ -106,11 +123,17 @@ def _verdict_from(raw: dict, signals: list[dict]) -> dict:
 def decide_sync(
     profile: dict, facts: list[dict], signals: list[dict], context: dict | None
 ) -> dict:
-    """Synchronous gate, for the on-demand briefing tool."""
+    """Synchronous gate for the on-demand tool.
+
+    Uses the pull instruction: the user asked, so the bar is "is this notable"
+    rather than "does this justify interrupting them".
+    """
     if not signals:
         return SILENT
     try:
-        raw = _decide_sync(_payload(profile, facts, signals, context))
+        raw = _decide_sync(
+            _payload(profile, facts, signals, context), PULL_INSTRUCTION
+        )
     except Exception:
         log.exception("salience gate failed; staying silent")
         return SILENT
