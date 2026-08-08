@@ -33,10 +33,13 @@ async def _keepalive(context) -> None:
 def main() -> None:
     settings = get_settings()
     _configure_logging(settings.log_level)
-    init_db()
 
-    # Free hosting tiers require an HTTP listener and sleep without traffic.
+    # Bind the port BEFORE touching the database. Hosts kill a web service that
+    # never opens a port, so doing this second turns any database problem into
+    # two misleading errors instead of one useful one.
     start_health_server(settings.port)
+
+    init_db()
 
     app = ApplicationBuilder().token(settings.telegram_token).build()
 
