@@ -168,21 +168,167 @@ def fetch_quote(symbol: str) -> dict | None:
     return None
 
 
+# ----------------------------------------------------------- fundamentals
+#
+# Yahoo's fundamentals endpoint now requires a crumb, so unlike quotes there is
+# no keyless option that survives a datacenter IP. A provider key is required in
+# production; yfinance covers local development only.
+
+
+def _fundamentals(symbol, name, source, **fields) -> dict:
+    return {"symbol": symbol.upper(), "name": name, "source": source, **fields}
+
+
+def finnhub_fundamentals(symbol: str) -> dict | None:
+    key = get_settings().finnhub_api_key
+    if not key:
+        return None
+    sym = symbol.upper()
+    profile = httpx.get(
+        "https://finnhub.io/api/v1/stock/profile2",
+        params={"symbol": sym, "token": key},
+        timeout=TIMEOUT,
+        headers=UA,
+    )
+    profile.raise_for_status()
+    p = profile.json()
+    if not p:
+        return None
+
+    metrics = httpx.get(
+        "https://finnhub.io/api/v1/stock/metric",
+        params={"symbol": sym, "metric": "all", "token": key},
+        timeout=TIMEOUT,
+        headers=UA,
+    )
+    m = metrics.json().get("metric", {}) if metrics.status_code == 200 else {}
+
+    cap = p.get("marketCapitalization")
+    return _fundamentals(
+        sym,
+        p.get("name"),
+        "Finnhub",
+        # Finnhub reports market cap in millions.
+        market_cap=int(cap * 1_000_000) if cap else None,
+        trailing_pe=m.get("peTTM"),
+        forward_pe=m.get("peBasicExclExtraTTM"),
+        profit_margin=(m.get("netProfitMarginTTM") / 100)
+        if m.get("netProfitMarginTTM") is not None
+        else None,
+        revenue_growth=(m.get("revenueGrowthTTMYoy") / 100)
+        if m.get("revenueGrowthTTMYoy") is not None
+        else None,
+        dividend_yield=m.get("dividendYieldIndicatedAnnual"),
+        sector=p.get("finnhubIndustry"),
+        industry=p.get("finnhubIndustry"),
+    )
+
+
+def fmp_fundamentals(symbol: str) -> dict | None:
+    key = get_settings().fmp_api_key
+    if not key:
+        return None
+    r = httpx.get(
+        f"https://financialmodelingprep.com/api/v3/profile/{symbol.upper()}",
+        params={"apikey": key},
+        timeout=TIMEOUT,
+        headers=UA,
+    )
+    r.raise_for_status()
+    rows = r.json()
+    if not rows:
+        return None
+    p = rows[0]
+    return _fundamentals(
+        symbol,
+        p.get("companyName"),
+        "FMP",
+        market_cap=p.get("mktCap"),
+        trailing_pe=None,
+        forward_pe=None,
+        profit_margin=None,
+        revenue_growth=None,
+        dividend_yield=p.get("lastDiv"),
+        sector=p.get("sector"),
+        industry=p.get("industry"),
+    )
+
+
+def yfinance_fundamentals(symbol: str) -> dict | None:
+    import yfinance as yf
+
+    info = yf.Ticker(symbol).info or {}
+    if not info.get("shortName"):
+        return None
+    return _fundamentals(
+        symbol,
+        info.get("shortName"),
+        "yfinance",
+        market_cap=info.get("marketCap"),
+        trailing_pe=info.get("trailingPE"),
+        forward_pe=info.get("forwardPE"),
+        profit_margin=info.get("profitMargins"),
+        revenue_growth=info.get("revenueGrowth"),
+        dividend_yield=info.get("dividendYield"),
+        sector=info.get("sector"),
+        industry=info.get("industry"),
+    )
+
+
+FUNDAMENTAL_PROVIDERS = (
+    ("finnhub", finnhub_fundamentals),
+    ("fmp", fmp_fundamentals),
+    ("yfinance", yfinance_fundamentals),
+)
+
+
+def fetch_fundamentals(symbol: str) -> dict | None:
+    for name, provider in FUNDAMENTAL_PROVIDERS:
+        try:
+            data = provider(symbol)
+        except Exception as exc:
+            log.debug("fundamentals provider %s failed for %s: %s", name, symbol, exc)
+            continue
+        if data is not None:
+            return data
+    log.warning("every fundamentals provider failed for %s", symbol)
+    return None
+
+
 def probe(symbol: str = "AAPL") -> dict:
     """Report which providers work from wherever this is running.
 
     Exists because provider availability depends on the host's IP, so it can only
     be answered from the deployed environment — not from a developer's laptop.
     """
-    results = {}
+    results = {"quotes": {}, "fundamentals": {}}
+
     for name, provider in QUOTE_PROVIDERS:
         try:
             quote = provider(symbol)
-            results[name] = (
+            results["quotes"][name] = (
                 {"ok": True, "price": quote["price"]}
                 if quote
                 else {"ok": False, "reason": "no data (key missing or unknown symbol)"}
             )
         except Exception as exc:
-            results[name] = {"ok": False, "reason": f"{type(exc).__name__}: {exc}"[:160]}
+            results["quotes"][name] = {
+                "ok": False,
+                "reason": f"{type(exc).__name__}: {exc}"[:160],
+            }
+
+    for name, provider in FUNDAMENTAL_PROVIDERS:
+        try:
+            data = provider(symbol)
+            results["fundamentals"][name] = (
+                {"ok": True, "pe": data.get("trailing_pe")}
+                if data
+                else {"ok": False, "reason": "no data (key missing or unknown symbol)"}
+            )
+        except Exception as exc:
+            results["fundamentals"][name] = {
+                "ok": False,
+                "reason": f"{type(exc).__name__}: {exc}"[:160],
+            }
+
     return results

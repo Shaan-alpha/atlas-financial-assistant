@@ -86,8 +86,22 @@ def test_get_quote_handles_an_index(monkeypatch):
     assert round(r["data"]["change_pct"], 2) == 0.49
 
 
+def _fake_fundamentals(symbol: str) -> dict | None:
+    info = FAKE.get(symbol.upper())
+    if info is None:
+        return None
+    return {
+        "symbol": symbol.upper(),
+        "name": info.get("shortName"),
+        "market_cap": info.get("marketCap"),
+        "trailing_pe": info.get("trailingPE"),
+        "sector": info.get("sector"),
+        "source": "TestProvider",
+    }
+
+
 def test_compare_companies_reports_partial_failure(monkeypatch):
-    monkeypatch.setattr(market, "_fetch_info", _fake_fetch)
+    monkeypatch.setattr(market, "_fetch_fundamentals", _fake_fundamentals)
 
     r = market.compare_companies(["AAPL", "XYZQ"])
 

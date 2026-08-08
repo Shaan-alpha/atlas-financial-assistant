@@ -92,30 +92,23 @@ def get_quote(symbol: str) -> dict:
     return ok(quote, source=quote.get("source", SOURCE))
 
 
+def _fetch_fundamentals(symbol: str) -> dict | None:
+    """Provider-chain seam for fundamentals. Tests monkeypatch this."""
+    from atlas.integrations import marketdata
+
+    return marketdata.fetch_fundamentals(symbol)
+
+
 def get_fundamentals(symbol: str) -> dict:
     """Return valuation and profile fundamentals for one listed security.
 
     Args:
         symbol: Ticker symbol, for example "NVDA".
     """
-    info = _fetch_info(symbol)
-    if info is None:
-        return err("no_such_symbol", f"No listed security matches '{symbol}'.")
-    return ok(
-        {
-            "symbol": symbol.upper(),
-            "name": info.get("shortName"),
-            "market_cap": info.get("marketCap"),
-            "trailing_pe": info.get("trailingPE"),
-            "forward_pe": info.get("forwardPE"),
-            "profit_margin": info.get("profitMargins"),
-            "revenue_growth": info.get("revenueGrowth"),
-            "dividend_yield": info.get("dividendYield"),
-            "sector": info.get("sector"),
-            "industry": info.get("industry"),
-        },
-        source=SOURCE,
-    )
+    data = _fetch_fundamentals(symbol)
+    if data is None:
+        return err("no_such_symbol", f"No fundamentals available for '{symbol}'.")
+    return ok(data, source=data.get("source", SOURCE))
 
 
 def compare_companies(symbols: list[str]) -> dict:

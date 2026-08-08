@@ -91,10 +91,38 @@ def test_keyed_providers_skip_themselves_when_unconfigured(monkeypatch):
 
 def test_probe_reports_every_provider(monkeypatch):
     _chain(monkeypatch, [("good", _good("G")), ("bad", _boom), ("empty", _none)])
+    monkeypatch.setattr(md, "FUNDAMENTAL_PROVIDERS", (("fnd", _none),))
 
     report = md.probe("AAPL")
 
-    assert report["good"]["ok"] is True
-    assert report["bad"]["ok"] is False
-    assert "blocked from this IP" in report["bad"]["reason"]
-    assert report["empty"]["ok"] is False
+    assert report["quotes"]["good"]["ok"] is True
+    assert report["quotes"]["bad"]["ok"] is False
+    assert "blocked from this IP" in report["quotes"]["bad"]["reason"]
+    assert report["quotes"]["empty"]["ok"] is False
+    assert report["fundamentals"]["fnd"]["ok"] is False
+
+
+def test_fundamentals_chain_falls_through(monkeypatch):
+    """Fundamentals need a keyed provider in production: Yahoo now demands a
+    crumb, so there is no keyless path that survives a datacenter IP."""
+
+    def _blocked(symbol):
+        raise RuntimeError("rate limited")
+
+    def _works(symbol):
+        return {"symbol": symbol, "name": "Test Co", "trailing_pe": 21.0,
+                "source": "Backup"}
+
+    monkeypatch.setattr(
+        md, "FUNDAMENTAL_PROVIDERS", (("a", _blocked), ("b", _works))
+    )
+
+    data = md.fetch_fundamentals("AAPL")
+
+    assert data["source"] == "Backup"
+    assert data["trailing_pe"] == 21.0
+
+
+def test_fundamentals_all_failing_returns_none(monkeypatch):
+    monkeypatch.setattr(md, "FUNDAMENTAL_PROVIDERS", (("a", _none),))
+    assert md.fetch_fundamentals("AAPL") is None
