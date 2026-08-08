@@ -11,6 +11,7 @@ is absent are skipped, so the bot still runs with none configured.
 """
 
 import logging
+import re
 
 import httpx
 
@@ -295,6 +296,34 @@ def fetch_fundamentals(symbol: str) -> dict | None:
     return None
 
 
+_SECRET_PARAM = re.compile(
+    r"((?:apikey|api_key|token|key)=)[^&\s'\"]+", re.IGNORECASE
+)
+
+
+def scrub(text: str) -> str:
+    """Remove credentials from text that will be shown publicly.
+
+    Provider errors quote the failing URL, and those URLs carry the API key as a
+    query parameter — so an unscrubbed diagnostic page hands out every key it has.
+    Both the parameter pattern and the exact configured values are removed,
+    because a key can also appear in a body or header echo.
+    """
+    text = _SECRET_PARAM.sub(r"\1***", text)
+    settings = get_settings()
+    for secret in (
+        settings.finnhub_api_key,
+        settings.fmp_api_key,
+        settings.alphavantage_api_key,
+        settings.gemini_api_key,
+        settings.groq_api_key,
+        settings.telegram_token,
+    ):
+        if secret and len(secret) >= 8:
+            text = text.replace(secret, "***")
+    return text
+
+
 def probe(symbol: str = "AAPL") -> dict:
     """Report which providers work from wherever this is running.
 
@@ -314,7 +343,7 @@ def probe(symbol: str = "AAPL") -> dict:
         except Exception as exc:
             results["quotes"][name] = {
                 "ok": False,
-                "reason": f"{type(exc).__name__}: {exc}"[:160],
+                "reason": scrub(f"{type(exc).__name__}: {exc}")[:160],
             }
 
     for name, provider in FUNDAMENTAL_PROVIDERS:
@@ -328,7 +357,7 @@ def probe(symbol: str = "AAPL") -> dict:
         except Exception as exc:
             results["fundamentals"][name] = {
                 "ok": False,
-                "reason": f"{type(exc).__name__}: {exc}"[:160],
+                "reason": scrub(f"{type(exc).__name__}: {exc}")[:160],
             }
 
     return results

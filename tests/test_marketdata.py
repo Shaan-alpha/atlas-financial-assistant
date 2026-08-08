@@ -126,3 +126,51 @@ def test_fundamentals_chain_falls_through(monkeypatch):
 def test_fundamentals_all_failing_returns_none(monkeypatch):
     monkeypatch.setattr(md, "FUNDAMENTAL_PROVIDERS", (("a", _none),))
     assert md.fetch_fundamentals("AAPL") is None
+
+
+# ------------------------------------------------------------- credentials
+
+
+def test_scrub_removes_api_keys_from_urls():
+    """Provider errors quote the failing URL, and those URLs carry the key.
+    /diag is a public endpoint, so an unscrubbed error hands out credentials."""
+    leaked = (
+        "HTTPStatusError: Client error '403 Forbidden' for url "
+        "'https://financialmodelingprep.com/api/v3/quote/AAPL?apikey=SUPERSECRETVALUE'"
+    )
+
+    cleaned = md.scrub(leaked)
+
+    assert "SUPERSECRETVALUE" not in cleaned
+    assert "apikey=***" in cleaned
+    assert "403 Forbidden" in cleaned  # the useful part survives
+
+
+@pytest.mark.parametrize("param", ["apikey", "api_key", "token", "KEY"])
+def test_scrub_covers_common_parameter_names(param):
+    assert "hunter2" not in md.scrub(f"https://x.test/a?{param}=hunter2&b=1")
+
+
+def test_scrub_removes_configured_secret_values_anywhere(monkeypatch):
+    """A key can leak in a body or header echo, not just a query string."""
+    monkeypatch.setenv("FINNHUB_API_KEY", "abcd1234efgh5678")
+    from atlas.config import get_settings
+
+    get_settings.cache_clear()
+
+    cleaned = md.scrub("upstream said: bad token abcd1234efgh5678 in header")
+
+    assert "abcd1234efgh5678" not in cleaned
+    assert "***" in cleaned
+
+
+def test_probe_output_is_scrubbed(monkeypatch):
+    def _leaky(symbol):
+        raise RuntimeError("failed for url 'https://x.test/q?apikey=LEAKED_KEY_HERE'")
+
+    monkeypatch.setattr(md, "QUOTE_PROVIDERS", (("leaky", _leaky),))
+    monkeypatch.setattr(md, "FUNDAMENTAL_PROVIDERS", (("leaky", _leaky),))
+
+    report = md.probe("AAPL")
+
+    assert "LEAKED_KEY_HERE" not in str(report)
