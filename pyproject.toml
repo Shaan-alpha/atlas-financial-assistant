@@ -1,7 +1,9 @@
 [project]
 name = "atlas"
 version = "0.1.0"
-requires-python = ">=3.13"
+# 3.11 is the real floor (union annotations and zip(strict=) need 3.10). Kept
+# permissive so a host defaulting to an older interpreter does not fail the build.
+requires-python = ">=3.11"
 dependencies = [
     "python-telegram-bot[job-queue]>=22.0",
     "google-genai>=1.33.0",
