@@ -1,9 +1,11 @@
 """Assemble and deliver one user's morning briefing."""
 
+import asyncio
 import logging
 from datetime import datetime, timezone
 from zoneinfo import ZoneInfo
 
+from atlas.engine import turnlock
 from atlas.memory import store
 from atlas.proactive import gather, salience
 
@@ -19,6 +21,19 @@ def local_today(tz_name: str) -> str:
     return datetime.now(tz).date().isoformat()
 
 
+def _gate_inputs(user_id: int):
+    """The three blocking reads the salience gate needs, in one hop.
+
+    market_context() is an HTTP call evaluated inline as an argument, so it
+    blocked the loop even though salience.decide is properly async.
+    """
+    return (
+        store.profile_snapshot(user_id),
+        store.all_facts(user_id),
+        gather.market_context(),
+    )
+
+
 async def build(user_id: int, tz_name: str) -> str | None:
     """Return the briefing text, or None when nothing is worth sending.
 
@@ -26,29 +41,32 @@ async def build(user_id: int, tz_name: str) -> str | None:
     """
     today = local_today(tz_name)
 
-    signals = gather.gather(user_id, today)
-    fresh_keys = store.filter_unsent(user_id, [s["key"] for s in signals])
+    # gather() is synchronous and does three blocking HTTP calls per watchlist
+    # name. On the event loop that freezes every in-flight turn at once, which
+    # only became survivable-looking because updates used to be serial.
+    signals = await asyncio.to_thread(gather.gather, user_id, today)
+    fresh_keys = await asyncio.to_thread(
+        store.filter_unsent, user_id, [s["key"] for s in signals]
+    )
     signals = [s for s in signals if s["key"] in set(fresh_keys)]
 
     if not signals:
         log.info("user %s: nothing new today, staying silent", user_id)
         return None
 
-    verdict = await salience.decide(
-        store.profile_snapshot(user_id),
-        store.all_facts(user_id),
-        signals,
-        gather.market_context(),
-    )
+    profile, facts, context = await asyncio.to_thread(_gate_inputs, user_id)
+    verdict = await salience.decide(profile, facts, signals, context)
 
     if not verdict["send"]:
         # Mark them seen anyway: the gate judged them unworthy, and re-offering
         # the same signals tomorrow would just ask the same question again.
-        store.mark_sent(user_id, [s["key"] for s in signals])
+        await asyncio.to_thread(
+            store.mark_sent, user_id, [s["key"] for s in signals]
+        )
         log.info("user %s: gate chose silence over %d signals", user_id, len(signals))
         return None
 
-    store.mark_sent(user_id, [s["key"] for s in signals])
+    await asyncio.to_thread(store.mark_sent, user_id, [s["key"] for s in signals])
     return verdict["brief"]
 
 
@@ -95,21 +113,25 @@ async def send_to(bot, user_id: int, telegram_id: int, tz_name: str) -> bool:
 
     from atlas.ingress.reply import to_telegram_markdown
 
-    try:
-        await bot.send_message(
-            chat_id=telegram_id,
-            text=to_telegram_markdown(brief),
-            parse_mode="Markdown",
-        )
-    except Exception:
-        log.warning("markdown briefing rejected; sending plain")
+    # Delivery only. build() stays outside the lock: it is multi-second work
+    # that touches no conversation state, and holding the lock across it would
+    # make a user's next message wait on their own briefing.
+    async with turnlock.user_turn(user_id):
         try:
-            await bot.send_message(chat_id=telegram_id, text=brief)
+            await bot.send_message(
+                chat_id=telegram_id,
+                text=to_telegram_markdown(brief),
+                parse_mode="Markdown",
+            )
         except Exception:
-            log.exception("briefing delivery failed for %s", telegram_id)
-            return False
+            log.warning("markdown briefing rejected; sending plain")
+            try:
+                await bot.send_message(chat_id=telegram_id, text=brief)
+            except Exception:
+                log.exception("briefing delivery failed for %s", telegram_id)
+                return False
 
-    store.append_message(user_id, "model", brief)
+        await asyncio.to_thread(store.append_message, user_id, "model", brief)
     return True
 
 

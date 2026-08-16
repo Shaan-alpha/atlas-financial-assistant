@@ -9,6 +9,7 @@ import logging
 
 from google.genai import types
 
+from atlas.engine import turnlock
 from atlas.engine.prompt import build_system_prompt
 from atlas.integrations.gemini import (
     CHAT_CHAIN,
@@ -100,14 +101,35 @@ async def _generate_resilient(contents, system_prompt: str, tools: list):
     return await _generate(CHAT_CHAIN[0], contents, system_prompt, tools)
 
 
-async def respond(
-    user_id: int, text: str, attachments: list[dict] | None = None
-) -> str:
+def _load_turn(user_id: int, text: str):
+    """Everything the turn needs, in one hop off the loop.
+
+    Grouped rather than awaited one by one: against a networked Postgres each
+    store call is its own round trip plus a commit, and this is the path the
+    user is actually waiting on.
+    """
     profile = store.profile_snapshot(user_id)
     facts = store.all_facts(user_id)
     history = store.recent_messages(user_id, limit=HISTORY_TURNS)
-
+    # Appended after the read, so this turn is not its own history.
     store.append_message(user_id, "user", text)
+    return profile, facts, history
+
+
+async def respond(
+    user_id: int, text: str, attachments: list[dict] | None = None
+) -> str:
+    # One turn at a time per user. The history read and the model append straddle
+    # the Gemini await, so overlapping turns from the same person would answer
+    # each other's prompts and interleave their rows in the log.
+    async with turnlock.user_turn(user_id):
+        return await _turn(user_id, text, attachments)
+
+
+async def _turn(
+    user_id: int, text: str, attachments: list[dict] | None = None
+) -> str:
+    profile, facts, history = await asyncio.to_thread(_load_turn, user_id, text)
 
     try:
         response = await _generate_resilient(
@@ -127,7 +149,7 @@ async def respond(
     if len(reply) > MAX_REPLY_CHARS:
         reply = reply[:MAX_REPLY_CHARS].rsplit(" ", 1)[0] + "…"
 
-    store.append_message(user_id, "model", reply)
+    await asyncio.to_thread(store.append_message, user_id, "model", reply)
 
     # Detached: memory writes must not add latency to the reply.
     task = asyncio.create_task(extract_and_store(user_id, text, reply))

@@ -8,11 +8,19 @@ from atlas.config import get_settings
 from atlas.db.session import init_db
 from atlas.health import ping, start_health_server
 from atlas.ingress import handlers
+from atlas.integrations import marketdata
 from atlas.proactive import alerts, scheduler
 
 log = logging.getLogger(__name__)
 
 KEEPALIVE_INTERVAL = dt.timedelta(minutes=10)
+
+# Bounded on purpose. Without this, updates are processed strictly one at a
+# time and a single slow turn (a PDF upload, a voice note) stalls every other
+# user. Unbounded is the wrong answer too: .concurrent_updates(True) means 256,
+# which is the entire connection pool and far past what a 5-request-per-minute
+# model quota can serve. Per-user ordering is kept by atlas.engine.turnlock.
+MAX_CONCURRENT_UPDATES = 16
 
 
 def _configure_logging(level: str) -> None:
@@ -64,9 +72,24 @@ def main() -> None:
     # two misleading errors instead of one useful one.
     start_health_server(settings.port)
 
+    # Kick off the ~12s yfinance import now so it lands on the boot window
+    # rather than on the first user who asks for price history. Returns
+    # immediately; the work happens on a daemon thread.
+    try:
+        marketdata.prewarm()
+    except Exception:
+        # Purely an optimisation — a host too constrained to spawn the thread
+        # must still get a running bot, just a slower first lookup.
+        log.warning("could not start the yfinance prewarm", exc_info=True)
+
     init_db()
 
-    app = ApplicationBuilder().token(settings.telegram_token).build()
+    app = (
+        ApplicationBuilder()
+        .token(settings.telegram_token)
+        .concurrent_updates(MAX_CONCURRENT_UPDATES)
+        .build()
+    )
 
     # /start only: Telegram's UI sends it on first open. No other command exists.
     app.add_handler(CommandHandler("start", handlers.start))
@@ -84,11 +107,18 @@ def main() -> None:
                 _keepalive, interval=KEEPALIVE_INTERVAL, first=KEEPALIVE_INTERVAL
             )
             log.info("keep-alive scheduled every %s", KEEPALIVE_INTERVAL)
+        else:
+            # The one setting whose absence is invisible: the free tier just
+            # sleeps, and the next user waits ~50s on a cold start.
+            log.warning("PUBLIC_URL not set: no keep-alive, expect cold starts")
     else:
         log.warning("no job queue: briefings and keep-alive are disabled")
 
     log.info("Atlas is up")
-    app.run_polling(drop_pending_updates=False)
+    # Drop the backlog. Telegram queues updates for 24h while the bot is down,
+    # and answering yesterday's "what's AAPL at?" on restart is worse than not
+    # answering it — the prices are stale and the burst spends the model quota.
+    app.run_polling(drop_pending_updates=True)
 
 
 if __name__ == "__main__":

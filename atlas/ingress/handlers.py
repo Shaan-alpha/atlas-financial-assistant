@@ -32,15 +32,19 @@ async def _typing(update: Update) -> None:
     await update.effective_chat.send_action(ChatAction.TYPING)
 
 
-def _user_id(update: Update) -> int:
+async def _user_id(update: Update) -> int:
     user = update.effective_user
-    return store.get_or_create_user(user.id, name=user.first_name)
+    # Blocking SQLAlchemy, and it runs ahead of the typing indicator on every
+    # single update — off-thread for the same reason as transcribe() below.
+    return await asyncio.to_thread(
+        store.get_or_create_user, user.id, name=user.first_name
+    )
 
 
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     """Telegram sends /start automatically on first open. Greet, never mention commands."""
-    uid = _user_id(update)
-    profile = store.profile_snapshot(uid)
+    uid = await _user_id(update)
+    profile = await asyncio.to_thread(store.profile_snapshot, uid)
     if profile["onboarding_state"] == "new":
         await send_reply(update.message, GREETING)
     else:
@@ -49,13 +53,13 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
 
 
 async def on_text(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    uid = _user_id(update)
+    uid = await _user_id(update)
     await _typing(update)
     await send_reply(update.message, await respond(uid, update.message.text))
 
 
 async def on_voice(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    uid = _user_id(update)
+    uid = await _user_id(update)
     await _typing(update)
 
     voice = update.message.voice or update.message.audio
@@ -64,7 +68,9 @@ async def on_voice(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
 
     # Bias transcription toward the tickers this user actually follows; spoken
     # ticker letters are the most error-prone thing in a finance voice note.
-    symbols = [item["symbol"] for item in store.get_watchlist(uid)]
+    symbols = [
+        item["symbol"] for item in await asyncio.to_thread(store.get_watchlist, uid)
+    ]
 
     # transcribe() is a blocking HTTP call — off-thread so one voice note does not
     # stall every other user's turn.
@@ -77,7 +83,7 @@ async def on_voice(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
 
 
 async def on_photo(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    uid = _user_id(update)
+    uid = await _user_id(update)
     await _typing(update)
 
     photo = update.message.photo[-1]  # last entry is the largest rendition
@@ -94,7 +100,7 @@ async def on_document(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
 
     Native ingest preserves tables and charts that text extraction would discard.
     """
-    uid = _user_id(update)
+    uid = await _user_id(update)
     await _typing(update)
 
     document = update.message.document

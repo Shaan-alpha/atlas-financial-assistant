@@ -10,8 +10,11 @@ come first because they are contractual rather than best-effort; ones whose key
 is absent are skipped, so the bot still runs with none configured.
 """
 
+import importlib
 import logging
 import re
+import threading
+import time
 
 import httpx
 
@@ -361,3 +364,32 @@ def probe(symbol: str = "AAPL") -> dict:
             }
 
     return results
+
+
+# ---------------------------------------------------------------- prewarm
+
+
+def _warm() -> None:
+    started = time.perf_counter()
+    try:
+        importlib.import_module("yfinance")
+    except Exception as exc:  # noqa: BLE001 - a warm cache is never worth a crash
+        log.warning("yfinance prewarm failed; first lookup will be slow: %s", exc)
+        return
+    log.info("yfinance prewarmed in %.1fs", time.perf_counter() - started)
+
+
+def prewarm() -> threading.Thread:
+    """Import yfinance off the boot path, in the background.
+
+    Cold-importing yfinance costs ~12s (pandas, numpy, curl_cffi). It is imported
+    lazily inside each yfinance-backed function, so without this the first user
+    to ask for price history waits out the whole import mid-reply. A Finnhub key
+    does not remove the cost: get_price_history and get_earnings_info have no
+    non-yfinance path at all, so this is unconditional.
+
+    Daemon, like the health server: a half-finished warm-up must not hold up exit.
+    """
+    thread = threading.Thread(target=_warm, name="yfinance-prewarm", daemon=True)
+    thread.start()
+    return thread

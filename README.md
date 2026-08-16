@@ -94,7 +94,8 @@ Python 3.13 · python-telegram-bot 22 · Gemini (chat, vision, documents, ground
 ## Tests
 
 ```bash
-pytest          # 162 tests
+pip install -e ".[dev]"
+pytest
 ```
 
 Weighted toward the behaviour most likely to regress quietly: the silence path. A briefing that fires when it shouldn't is the failure a user actually notices, and it is invisible in a happy-path test.
@@ -102,7 +103,7 @@ Weighted toward the behaviour most likely to regress quietly: the silence path. 
 ## Running it
 
 ```bash
-cp .env.example .env      # add TELEGRAM_TOKEN, GEMINI_API_KEY, GROQ_API_KEY, FINNHUB_API_KEY
+cp .env.example .env      # TELEGRAM_TOKEN, GEMINI_API_KEY, GROQ_API_KEY are required; market-data keys are optional
 pip install -e .
 python -m atlas.main
 ```

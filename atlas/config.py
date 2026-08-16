@@ -39,6 +39,14 @@ def _normalize_database_url(raw: str) -> str:
     return raw
 
 
+def _normalize_public_url(raw: str | None) -> str | None:
+    """Hosts display the bare hostname, and httpx refuses a URL with no scheme —
+    which turns the keep-alive into a silent no-op."""
+    if not raw:
+        return None
+    return raw if "://" in raw else f"https://{raw}"
+
+
 @lru_cache(maxsize=1)
 def get_settings() -> Settings:
     return Settings(
@@ -50,7 +58,7 @@ def get_settings() -> Settings:
         ),
         log_level=os.environ.get("LOG_LEVEL", "INFO"),
         port=int(os.environ.get("PORT", "8080")),
-        public_url=os.environ.get("PUBLIC_URL") or None,
+        public_url=_normalize_public_url(os.environ.get("PUBLIC_URL")),
         finnhub_api_key=os.environ.get("FINNHUB_API_KEY") or None,
         fmp_api_key=os.environ.get("FMP_API_KEY") or None,
         alphavantage_api_key=os.environ.get("ALPHAVANTAGE_API_KEY") or None,

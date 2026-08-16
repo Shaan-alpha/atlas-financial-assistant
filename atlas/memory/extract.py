@@ -1,5 +1,6 @@
 """Background extraction of durable facts from a completed turn."""
 
+import asyncio
 import json
 import logging
 import re
@@ -68,6 +69,13 @@ async def extract_and_store(user_id: int, user_text: str, reply: str) -> int:
         log.exception("fact extraction failed for user %s", user_id)
         return 0
 
+    # One hop, not one per fact: add_fact is a SELECT + INSERT + COMMIT each,
+    # and this fires right after a reply went out — exactly when the loop has
+    # other people's turns to run.
+    return await asyncio.to_thread(_store_facts, user_id, items)
+
+
+def _store_facts(user_id: int, items) -> int:
     stored = 0
     for item in items or []:
         fact = (item.get("fact") or "").strip() if isinstance(item, dict) else ""

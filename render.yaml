@@ -3,6 +3,9 @@
 
 databases:
   - name: atlas-db
+    # Render's free Postgres is time-limited: it expires roughly a month after
+    # creation and takes every user's onboarding and memory with it. Upgrade
+    # before that matters.
     plan: free
     databaseName: atlas
     user: atlas
@@ -55,5 +58,10 @@ services:
       # This service's own public URL, e.g. https://atlas-financial-assistant.onrender.com
       # Enables the 10-minute self-ping that stops the free tier sleeping, so a
       # judge never waits ~50s on a cold start.
+      #
+      # The service has no URL until it exists, so this is filled in after the
+      # first deploy. Skipping it is not an error -- the bot boots fine and just
+      # sleeps -- so the startup log warns when it is unset. A bare hostname is
+      # accepted; the scheme is added for you.
       - key: PUBLIC_URL
         sync: false
