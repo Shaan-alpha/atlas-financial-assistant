@@ -160,9 +160,13 @@ def main() -> None:
             )
             log.info("keep-alive scheduled every %s", KEEPALIVE_INTERVAL)
         else:
-            # The one setting whose absence is invisible: the free tier just
-            # sleeps, and the next user waits ~50s on a cold start.
-            log.warning("PUBLIC_URL not set: no keep-alive, expect cold starts")
+            # Only a problem on a host that sleeps when idle. On an always-on
+            # box the self-ping is pointless, so state the condition rather
+            # than predicting a cold start that will never come.
+            log.info(
+                "PUBLIC_URL not set: self-ping disabled (correct on an "
+                "always-on host; on a sleeping free tier expect ~50s cold starts)"
+            )
     else:
         log.warning("no job queue: briefings and keep-alive are disabled")
 

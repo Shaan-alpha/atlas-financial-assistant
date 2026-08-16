@@ -108,4 +108,36 @@ pip install -e .
 python -m atlas.main
 ```
 
-Deploys to Render from [`render.yaml`](render.yaml) as a Blueprint — web service plus Postgres. Keep both in the same region; Render's internal database hostname is region-scoped and will not resolve across regions.
+### Deployment
+
+Runs on an Azure VM under `systemd`, with Postgres 18 on the same host and a
+nightly `pg_dump` on a systemd timer.
+
+The hosting choice is load-bearing rather than incidental. Atlas is a long-lived
+polling process: it holds a `getUpdates` long poll and runs an in-process
+scheduler for briefings and alerts. On a free tier that sleeps when idle, that
+shape fails badly — polling is *outbound*, so a sleeping bot is never woken by a
+Telegram message, only by unrelated HTTP traffic.
+
+Worse, the failure is silent. The health server runs on its own thread, so when
+polling dies the process keeps answering `200` while fetching nothing, and a
+platform health check sees a service in perfect health. Atlas answered nobody
+for days that way.
+
+Two things fix it. `atlas/main.py` runs a watchdog that force-exits when the
+Application is up but the poller underneath it has finished, and `/` returns
+`503` once polling has stopped instead of a cheerful `200`. `systemd` then does
+what a health check could not:
+
+```ini
+Restart=always
+RestartSec=5
+StartLimitIntervalSec=0    # in [Unit] — systemd ignores it under [Service]
+```
+
+Verified by `kill -9`: back and polling in six seconds.
+
+[`render.yaml`](render.yaml) is kept for one-command Blueprint deploys. If you
+use it, set `PUBLIC_URL` so the self-ping keeps the service awake, and keep the
+database in the web service's region — Render's internal database hostname is
+region-scoped and will not resolve across regions.
