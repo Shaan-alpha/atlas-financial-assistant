@@ -1,8 +1,30 @@
 import httpx
 import pytest
 
+import atlas.health as health
 from atlas.config import _normalize_database_url
 from atlas.health import ping, start_health_server
+
+
+@pytest.fixture
+def polling_stopped():
+    """The module flag is global; put it back so later tests still see 200."""
+    health.mark_polling_stopped()
+    yield
+    health._polling_stopped.clear()
+
+
+def test_health_reports_unhealthy_once_polling_stops(polling_stopped):
+    """A dead poller behind a 200 is the whole bug: the host sees a healthy
+    service and never restarts a bot that is answering nobody."""
+    server = start_health_server(0)
+    try:
+        port = server.server_address[1]
+        resp = httpx.get(f"http://127.0.0.1:{port}/", timeout=5)
+        assert resp.status_code == 503
+        assert "polling" in resp.text
+    finally:
+        server.shutdown()
 
 
 def test_health_server_answers_200():

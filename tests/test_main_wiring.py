@@ -42,7 +42,14 @@ def run_main(monkeypatch):
     def _prewarm():
         seen["prewarms"] += 1
 
+    def _exit(code):
+        # main() ends in os._exit so a dead poller cannot linger as a zombie.
+        # Unpatched, that would take pytest itself down with it.
+        seen["exit_code"] = code
+
     monkeypatch.setattr(Application, "run_polling", _run_polling)
+    monkeypatch.setattr(main.os, "_exit", _exit)
+    monkeypatch.setattr(main, "mark_polling_stopped", lambda: seen.__setitem__("marked", True))
     monkeypatch.setattr(main, "start_health_server", _health)
     monkeypatch.setattr(main, "init_db", _init_db)
     monkeypatch.setattr(main, "_configure_logging", lambda level: None)
@@ -111,6 +118,16 @@ def test_no_public_url_means_no_self_ping(run_main):
 
 def test_startup_kicks_off_the_yfinance_prewarm(run_main):
     assert run_main()["prewarms"] == 1
+
+
+def test_a_dead_poller_takes_the_process_down(run_main):
+    """The failure this exists for: a redeploy overlap raises getUpdates
+    Conflict, PTB tears the Application down, and the health thread keeps
+    answering 200 — so the host never restarts a bot that is serving nobody."""
+    seen = run_main()
+
+    assert seen["exit_code"] == 1
+    assert seen.get("marked") is True
 
 
 def test_a_broken_prewarm_does_not_stop_the_bot(run_main, monkeypatch):

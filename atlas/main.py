@@ -1,12 +1,13 @@
 import datetime as dt
 import logging
+import os
 
 from telegram.error import Conflict
 from telegram.ext import ApplicationBuilder, CommandHandler, MessageHandler, filters
 
 from atlas.config import get_settings
 from atlas.db.session import init_db
-from atlas.health import ping, start_health_server
+from atlas.health import mark_polling_stopped, ping, start_health_server
 from atlas.ingress import handlers
 from atlas.integrations import marketdata
 from atlas.proactive import alerts, scheduler
@@ -115,10 +116,27 @@ def main() -> None:
         log.warning("no job queue: briefings and keep-alive are disabled")
 
     log.info("Atlas is up")
-    # Drop the backlog. Telegram queues updates for 24h while the bot is down,
-    # and answering yesterday's "what's AAPL at?" on restart is worse than not
-    # answering it — the prices are stale and the burst spends the model quota.
-    app.run_polling(drop_pending_updates=True)
+    try:
+        # Drop the backlog. Telegram queues updates for 24h while the bot is
+        # down, and answering yesterday's "what's AAPL at?" on restart is worse
+        # than not answering it — stale prices, and the burst spends the quota.
+        app.run_polling(drop_pending_updates=True)
+    finally:
+        # Polling has stopped, and that is never survivable: a redeploy overlap
+        # raises getUpdates Conflict, python-telegram-bot tears the Application
+        # down, and what is left is a process that still answers health checks
+        # while serving nobody. It looks alive and stays dead until someone
+        # notices. Report unhealthy, then take the process down so the host
+        # restarts us — by which time the old instance has finished draining.
+        log.error("telegram polling stopped; exiting so the host restarts us")
+        mark_polling_stopped()
+        # Flush by hand: _exit skips atexit, and losing this line would leave
+        # the restart looking unexplained in the host's log.
+        for handler in logging.getLogger().handlers:
+            handler.flush()
+        # _exit, not sys.exit: a hung shutdown thread must not be able to keep
+        # the zombie alive, and that hang is the exact failure being fixed.
+        os._exit(1)
 
 
 if __name__ == "__main__":

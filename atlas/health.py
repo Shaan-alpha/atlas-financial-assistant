@@ -17,11 +17,32 @@ import httpx
 
 log = logging.getLogger(__name__)
 
+# Whether the Telegram poller is still running. This matters because the health
+# server lives on its own thread: when polling dies — a getUpdates Conflict from
+# a redeploy overlap is the usual way — this thread carries on answering 200, the
+# host sees a healthy service, and the bot silently answers nobody for hours.
+# Reporting the truth here is what turns that into a restart.
+_polling_stopped = threading.Event()
+
+
+def mark_polling_stopped() -> None:
+    _polling_stopped.set()
+
 
 class _HealthHandler(BaseHTTPRequestHandler):
     def do_GET(self):
         if self.path.startswith("/diag"):
             self._diag()
+            return
+        # Only ever unhealthy after polling has run and stopped; a service still
+        # starting up answers 200 so the platform's first check does not fail it.
+        if _polling_stopped.is_set():
+            body = b"atlas unhealthy: telegram polling has stopped"
+            self.send_response(503)
+            self.send_header("Content-Type", "text/plain")
+            self.send_header("Content-Length", str(len(body)))
+            self.end_headers()
+            self.wfile.write(body)
             return
         self.send_response(200)
         self.send_header("Content-Type", "text/plain")
