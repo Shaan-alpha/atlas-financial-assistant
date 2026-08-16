@@ -8,6 +8,7 @@ that reach outside the process, and all three are replaced.
 
 import sys
 import threading
+from types import SimpleNamespace
 
 import pytest
 from telegram.ext import Application
@@ -118,6 +119,35 @@ def test_no_public_url_means_no_self_ping(run_main):
 
 def test_startup_kicks_off_the_yfinance_prewarm(run_main):
     assert run_main()["prewarms"] == 1
+
+
+def test_the_watchdog_spots_a_running_app_with_a_dead_poller():
+    """The zombie, exactly: Application up, job queue ticking, polling task
+    finished. Both flags drop together on a real shutdown, so only this shape
+    means the bot is answering nobody."""
+    done = SimpleNamespace(done=lambda: True)
+    alive = SimpleNamespace(done=lambda: False)
+
+    def app(running, task):
+        return SimpleNamespace(
+            running=running, updater=SimpleNamespace(_Updater__polling_task=task)
+        )
+
+    assert main._polling_is_dead(app(True, done)) is True
+    # Healthy: still polling.
+    assert main._polling_is_dead(app(True, alive)) is False
+    # A genuine shutdown drops both — not a zombie, do not force-exit.
+    assert main._polling_is_dead(app(False, done)) is False
+    # No updater at all (job-queue-less builds) must not trip it.
+    assert main._polling_is_dead(SimpleNamespace(running=True, updater=None)) is False
+
+
+def test_the_watchdog_survives_a_renamed_internal():
+    """It reads a private PTB attribute. If that name ever changes the watchdog
+    must go quiet, not crash the bot it exists to protect."""
+    app = SimpleNamespace(running=True, updater=SimpleNamespace())
+
+    assert main._polling_is_dead(app) is False
 
 
 def test_a_dead_poller_takes_the_process_down(run_main):

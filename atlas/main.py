@@ -1,6 +1,8 @@
 import datetime as dt
 import logging
 import os
+import threading
+import time
 
 from telegram.error import Conflict
 from telegram.ext import ApplicationBuilder, CommandHandler, MessageHandler, filters
@@ -15,6 +17,10 @@ from atlas.proactive import alerts, scheduler
 log = logging.getLogger(__name__)
 
 KEEPALIVE_INTERVAL = dt.timedelta(minutes=10)
+
+# How often to check that polling is still alive. Short enough that a dead bot is
+# restarted within a minute or so; long enough to be free.
+WATCHDOG_INTERVAL = 45.0
 
 # Bounded on purpose. Without this, updates are processed strictly one at a
 # time and a single slow turn (a PDF upload, a voice note) stalls every other
@@ -62,6 +68,51 @@ async def _on_error(update, context) -> None:
             )
         except Exception:
             log.debug("could not deliver the error notice")
+
+
+def _polling_is_dead(app) -> bool:
+    """True when the Application is up but the poller underneath it has finished.
+
+    Observed on Render: a redeploy overlap raises getUpdates Conflict, the
+    Updater's polling task ends, and the Application, its job queue and the
+    health-server thread all carry on. The process then answers 200 forever
+    while fetching no messages, so the host never restarts it.
+
+    Both flags drop together on a genuine shutdown; only the zombie shows a
+    running Application with a finished polling task. The private attribute is
+    read defensively — if a future version renames it, this degrades to never
+    firing rather than to a crash.
+    """
+    updater = getattr(app, "updater", None)
+    if updater is None or not app.running:
+        return False
+    task = getattr(updater, "_Updater__polling_task", None)
+    return task is not None and task.done()
+
+
+def _watch_polling(app) -> None:
+    while True:
+        time.sleep(WATCHDOG_INTERVAL)
+        try:
+            if not _polling_is_dead(app):
+                continue
+            log.error("telegram polling has died; exiting so the host restarts us")
+        except Exception:  # noqa: BLE001 - the watchdog must never take the bot down
+            log.debug("watchdog check failed", exc_info=True)
+            continue
+        _die()
+
+
+def _die() -> None:
+    """Report unhealthy, flush, and go — so the platform restarts a fresh process."""
+    mark_polling_stopped()
+    # Flush by hand: _exit skips atexit, and losing these lines would leave the
+    # restart looking unexplained in the host's log.
+    for handler in logging.getLogger().handlers:
+        handler.flush()
+    # _exit, not sys.exit: a hung shutdown must not keep the zombie alive, and
+    # that hang is the exact failure being fixed.
+    os._exit(1)
 
 
 def main() -> None:
@@ -115,6 +166,10 @@ def main() -> None:
     else:
         log.warning("no job queue: briefings and keep-alive are disabled")
 
+    threading.Thread(
+        target=_watch_polling, args=(app,), name="polling-watchdog", daemon=True
+    ).start()
+
     log.info("Atlas is up")
     try:
         # Drop the backlog. Telegram queues updates for 24h while the bot is
@@ -122,21 +177,11 @@ def main() -> None:
         # than not answering it — stale prices, and the burst spends the quota.
         app.run_polling(drop_pending_updates=True)
     finally:
-        # Polling has stopped, and that is never survivable: a redeploy overlap
-        # raises getUpdates Conflict, python-telegram-bot tears the Application
-        # down, and what is left is a process that still answers health checks
-        # while serving nobody. It looks alive and stays dead until someone
-        # notices. Report unhealthy, then take the process down so the host
-        # restarts us — by which time the old instance has finished draining.
-        log.error("telegram polling stopped; exiting so the host restarts us")
-        mark_polling_stopped()
-        # Flush by hand: _exit skips atexit, and losing this line would leave
-        # the restart looking unexplained in the host's log.
-        for handler in logging.getLogger().handlers:
-            handler.flush()
-        # _exit, not sys.exit: a hung shutdown thread must not be able to keep
-        # the zombie alive, and that hang is the exact failure being fixed.
-        os._exit(1)
+        # Covers the tidy case where run_polling actually returns. It often does
+        # not — the observed zombie keeps the loop alive with polling dead — so
+        # the watchdog above is what usually catches it.
+        log.error("run_polling returned; exiting so the host restarts us")
+        _die()
 
 
 if __name__ == "__main__":
