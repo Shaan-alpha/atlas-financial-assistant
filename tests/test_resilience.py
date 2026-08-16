@@ -11,6 +11,7 @@ import atlas.engine.conversation as conversation
 from atlas.integrations.gemini import (
     CHAT_CHAIN,
     is_rate_limited,
+    is_transient,
     retry_after_seconds,
 )
 from atlas.memory import store
@@ -132,3 +133,68 @@ def test_durable_turns_trigger_extraction(text):
 )
 def test_throwaway_turns_skip_extraction(text):
     assert looks_durable(text) is False
+
+
+# --- transient upstream faults ------------------------------------------------
+#
+# A 499 CANCELLED on the first request of a fresh process cost a real user their
+# whole turn: the chain aborted on the preferred model with two untried models
+# still in it, and they got "I hit trouble reaching my data sources just then."
+
+
+class _Cancelled(Exception):
+    """Shaped like google.genai.errors.ClientError, which carries .code."""
+
+    code = 499
+
+    def __str__(self):
+        return "499 CANCELLED. {'error': {'status': 'CANCELLED'}}"
+
+
+class _Answer:
+    def __init__(self, text):
+        self.text = text
+
+
+def test_a_cancelled_request_is_transient():
+    assert is_transient(_Cancelled()) is True
+    assert is_transient(Exception("503 UNAVAILABLE")) is True
+    # Not transient: a real fault that merely mentions a number.
+    assert is_transient(RuntimeError("upstream 503")) is False
+    assert is_transient(ValueError("bad request")) is False
+
+
+async def test_a_transient_fault_falls_through_to_the_next_model(monkeypatch):
+    tried = []
+
+    async def _fake(model, contents, system_prompt, tools):
+        tried.append(model)
+        if len(tried) == 1:
+            raise _Cancelled()
+        return _Answer("NVDA is at 225.16.")
+
+    monkeypatch.setattr(conversation, "_generate", _fake)
+    uid = store.get_or_create_user(700, "Shaan")
+
+    reply = await conversation.respond(uid, "what's NVDA at?")
+
+    assert "225.16" in reply
+    assert tried == list(conversation.CHAT_CHAIN[:2])
+
+
+async def test_a_genuine_fault_still_aborts_the_chain(monkeypatch):
+    """Only transient and quota errors are worth another model. Retrying a real
+    fault three times just makes the user wait three times as long for it."""
+    tried = []
+
+    async def _fake(model, contents, system_prompt, tools):
+        tried.append(model)
+        raise ValueError("malformed request")
+
+    monkeypatch.setattr(conversation, "_generate", _fake)
+    uid = store.get_or_create_user(701, "Shaan")
+
+    reply = await conversation.respond(uid, "hello")
+
+    assert reply == conversation.FAILURE_REPLY
+    assert tried == [conversation.CHAT_CHAIN[0]]

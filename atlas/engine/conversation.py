@@ -15,6 +15,7 @@ from atlas.integrations.gemini import (
     CHAT_CHAIN,
     get_client,
     is_rate_limited,
+    is_transient,
     retry_after_seconds,
 )
 from atlas.memory import store
@@ -81,8 +82,10 @@ async def _generate_resilient(contents, system_prompt: str, tools: list):
     """Try each model in the chain, then wait out the quota window once.
 
     Free-tier quota is per model, so a 429 on the preferred model does not mean the
-    next one is also exhausted. Non-quota errors abort immediately — retrying a
-    genuine fault just wastes the user's time.
+    next one is also exhausted. Transient upstream faults are also worth carrying
+    to the next model — a 499 CANCELLED on the first request of a fresh process
+    used to abort the whole turn with two untried models still in the chain.
+    Anything else is a genuine fault: retrying it just wastes the user's time.
     """
     last: Exception | None = None
 
@@ -91,9 +94,12 @@ async def _generate_resilient(contents, system_prompt: str, tools: list):
             return await _generate(model, contents, system_prompt, tools)
         except Exception as exc:
             last = exc
-            if not is_rate_limited(exc):
+            if is_rate_limited(exc):
+                log.warning("%s rate limited, trying next model", model)
+            elif is_transient(exc):
+                log.warning("%s failed transiently (%s), trying next model", model, exc)
+            else:
                 raise
-            log.warning("%s rate limited, trying next model", model)
 
     delay = min(retry_after_seconds(last) if last else 5.0, MAX_QUOTA_WAIT)
     log.warning("all models rate limited; waiting %.1fs before one final attempt", delay)

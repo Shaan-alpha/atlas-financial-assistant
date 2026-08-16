@@ -46,6 +46,28 @@ def is_rate_limited(exc: Exception) -> bool:
     return "429" in text or "RESOURCE_EXHAUSTED" in text
 
 
+# Transient upstream faults. Unlike a malformed request, these say nothing about
+# the call itself, so the next model in the chain is worth trying. 499 CANCELLED
+# is the one seen in practice: it turns up on the first request a fresh process
+# makes, and aborting on it costs the user their whole turn while two untried
+# models sit in the chain.
+_TRANSIENT_CODES = frozenset({499, 500, 502, 503, 504})
+_TRANSIENT_STATUSES = ("CANCELLED", "UNAVAILABLE", "INTERNAL", "DEADLINE_EXCEEDED")
+
+
+def is_transient(exc: Exception) -> bool:
+    """True when Gemini failed for a reason a retry could plausibly survive.
+
+    Deliberately keyed on the API error code and status rather than on loose
+    substrings: matching "503" anywhere in a message would swallow genuine
+    faults that happen to mention it.
+    """
+    if getattr(exc, "code", None) in _TRANSIENT_CODES:
+        return True
+    text = str(exc)
+    return any(status in text for status in _TRANSIENT_STATUSES)
+
+
 def retry_after_seconds(exc: Exception, default: float = 5.0) -> float:
     """Seconds Gemini asked us to wait, when it says so."""
     match = _RETRY_SECONDS.search(str(exc))
