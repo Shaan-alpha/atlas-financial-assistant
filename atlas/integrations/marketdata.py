@@ -25,6 +25,12 @@ log = logging.getLogger(__name__)
 TIMEOUT = 12
 UA = {"User-Agent": "Mozilla/5.0 (compatible; Atlas/1.0)"}
 
+# FMP retired /api/v3 on 2025-08-31 — it now answers 403 "Legacy Endpoint" for
+# anyone who subscribed after that date, which reads exactly like a bad key. The
+# replacement is /stable, and it takes the symbol as a query parameter rather
+# than in the path.
+FMP_BASE = "https://financialmodelingprep.com/stable"
+
 
 def _pct(price, prev):
     if price is None or not prev:
@@ -72,8 +78,8 @@ def fmp_quote(symbol: str) -> dict | None:
     if not key:
         return None
     r = httpx.get(
-        f"https://financialmodelingprep.com/api/v3/quote/{symbol.upper()}",
-        params={"apikey": key},
+        FMP_BASE + "/quote",
+        params={"symbol": symbol.upper(), "apikey": key},
         timeout=TIMEOUT,
         headers=UA,
     )
@@ -233,8 +239,8 @@ def fmp_fundamentals(symbol: str) -> dict | None:
     if not key:
         return None
     r = httpx.get(
-        f"https://financialmodelingprep.com/api/v3/profile/{symbol.upper()}",
-        params={"apikey": key},
+        FMP_BASE + "/profile",
+        params={"symbol": symbol.upper(), "apikey": key},
         timeout=TIMEOUT,
         headers=UA,
     )
@@ -243,16 +249,17 @@ def fmp_fundamentals(symbol: str) -> dict | None:
     if not rows:
         return None
     p = rows[0]
+    # /stable renamed these: mktCap -> marketCap, lastDiv -> lastDividend.
     return _fundamentals(
         symbol,
         p.get("companyName"),
         "FMP",
-        market_cap=p.get("mktCap"),
+        market_cap=p.get("marketCap"),
         trailing_pe=None,
         forward_pe=None,
         profit_margin=None,
         revenue_growth=None,
-        dividend_yield=p.get("lastDiv"),
+        dividend_yield=p.get("lastDividend"),
         sector=p.get("sector"),
         industry=p.get("industry"),
     )

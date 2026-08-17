@@ -134,9 +134,12 @@ def test_fundamentals_all_failing_returns_none(monkeypatch):
 def test_scrub_removes_api_keys_from_urls():
     """Provider errors quote the failing URL, and those URLs carry the key.
     /diag is a public endpoint, so an unscrubbed error hands out credentials."""
+    # The real shape: on /stable the key trails a symbol parameter, so the
+    # scrub has to catch &apikey=, not just ?apikey=.
     leaked = (
         "HTTPStatusError: Client error '403 Forbidden' for url "
-        "'https://financialmodelingprep.com/api/v3/quote/AAPL?apikey=SUPERSECRETVALUE'"
+        "'https://financialmodelingprep.com/stable/quote"
+        "?symbol=AAPL&apikey=SUPERSECRETVALUE'"
     )
 
     cleaned = md.scrub(leaked)
@@ -144,6 +147,7 @@ def test_scrub_removes_api_keys_from_urls():
     assert "SUPERSECRETVALUE" not in cleaned
     assert "apikey=***" in cleaned
     assert "403 Forbidden" in cleaned  # the useful part survives
+    assert "symbol=AAPL" in cleaned  # and so does the context you need
 
 
 @pytest.mark.parametrize("param", ["apikey", "api_key", "token", "KEY"])
