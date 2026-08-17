@@ -17,7 +17,7 @@ Atlas holds a conversation. It learns who you are as you talk, pulls live market
 - **Memory that persists** — role, timezone, watchlist, and durable facts, across restarts.
 - **Proactive briefings and alerts** — including the decision *not* to send one.
 
-## Four decisions worth reading the code for
+## Five decisions worth reading the code for
 
 ### 1. Documents are handed to the model whole
 
@@ -47,17 +47,55 @@ Push and pull run **different instructions against the same body**. An unprompte
 Atlas chains five quote providers and three fundamentals providers ([`atlas/integrations/marketdata.py`](atlas/integrations/marketdata.py)), and exposes `/diag` so provider health can be read **from the running host**:
 
 ```
-/diag  →  quotes:       finnhub ✓  yahoo ✓  fmp ✗  alphavantage ✗  yfinance ✗ (rate limited)
-          fundamentals: finnhub ✓
+/diag  →  quotes:       finnhub ✓  fmp ✓  yahoo ✓  alphavantage ✓  yfinance ✓
+          fundamentals: finnhub ✓  fmp ✓  yfinance ✓
 ```
 
-That endpoint is why the deployed bot answers instead of apologising. Provider errors are scrubbed of API keys before they are shown.
+That endpoint is why the deployed bot answers instead of apologising. Provider
+errors are scrubbed of API keys before they are shown — `/diag` is public, and an
+unscrubbed error hands out credentials.
+
+It also catches the failure mode that looks like a working system. Two providers
+once sat dead in the chain for weeks: one key was never set, and FMP answered
+`403` on every call because it had retired `/api/v3` and served only a *"Legacy
+Endpoint"* message to keys issued after August 2025. A 403 reads exactly like a
+rejected key, so the key got blamed. The endpoint was the problem. Nothing broke
+visibly, because the provider *below* them in the chain answered — which is the
+whole point of a chain, and precisely why it needs a health endpoint to see
+inside it.
 
 ### 4. Rate limits are routed around, not waited out
 
 Gemini's free tier meters **per model**: 5 requests/minute for each. So a 429 on one model is not a global stop — falling back to a *different* model draws from a fresh bucket.
 
-Atlas walks a model chain per workload ([`atlas/integrations/gemini.py`](atlas/integrations/gemini.py)), aborts immediately on non-quota errors rather than burning the chain, and caps total wait so a user never watches a spinner for a minute.
+Atlas walks a model chain per workload ([`atlas/integrations/gemini.py`](atlas/integrations/gemini.py)) and caps total wait so a user never watches a spinner for a minute.
+
+Quota is not the only thing worth surviving. Transient upstream faults — `499
+CANCELLED`, `503 UNAVAILABLE` — also carry to the next model, because they say
+nothing about the request itself. That distinction was learned the hard way: a
+`499` on the first call of a freshly deployed process aborted the whole turn with
+two untried models still in the chain, and the user got an apology instead of a
+quote. Genuine faults still stop at the first model, since retrying a malformed
+request three times only makes someone wait three times as long to be told no.
+
+### 5. Concurrency is per-user ordered, not free-for-all
+
+Updates used to be processed strictly one at a time, so one slow turn — a PDF
+upload, a voice note — stalled every other user behind it.
+
+Running them concurrently removes that, but it also removes the accidental
+protection serial processing gave: `respond()` reads the conversation history,
+*then* appends to it, with a multi-second model call in between. Two overlapping
+turns from one person would each answer a prompt the other had already
+invalidated, then interleave their rows in the log. Because history is ordered by
+row id, a tangled pair stays tangled for the next twenty turns.
+
+So [`atlas/engine/turnlock.py`](atlas/engine/turnlock.py) holds one lock per user
+in a `WeakValueDictionary` — different people run in parallel, one person's turns
+never overlap, and the registry cannot grow without bound because a lock exists
+only while someone holds or waits on it. What that buys is mutual exclusion, not
+arrival ordering; the docstring says so plainly rather than promising a guarantee
+the design does not make.
 
 ## Architecture
 
@@ -89,16 +127,25 @@ Telegram  ─→  ingress/     normalize text · voice · photo · document
 
 ## Stack
 
-Python 3.13 · python-telegram-bot 22 · Gemini (chat, vision, documents, grounded search) · Groq Whisper `large-v3-turbo` · PostgreSQL + SQLAlchemy 2.0 / psycopg3 · APScheduler · Finnhub · Yahoo · SEC EDGAR · Render
+Python 3.13 · python-telegram-bot 22 · Gemini (chat, vision, documents, grounded search) · Groq Whisper `large-v3-turbo` · PostgreSQL 18 + SQLAlchemy 2.0 / psycopg3 · APScheduler · Finnhub · FMP · Yahoo · Alpha Vantage · SEC EDGAR · Azure VM under systemd
 
 ## Tests
 
 ```bash
 pip install -e ".[dev]"
-pytest
+pytest          # 191 tests
 ```
 
 Weighted toward the behaviour most likely to regress quietly: the silence path. A briefing that fires when it shouldn't is the failure a user actually notices, and it is invisible in a happy-path test.
+
+The same bias explains the newer files. `tests/test_concurrency.py` pins the
+per-user ordering above — a test that two turns interleave is worthless unless it
+also proves two *different* users still overlap. `tests/test_main_wiring.py`
+exists because `main()` had no coverage at all, which is exactly how a bot that
+replayed a day-old backlog on every restart went unnoticed. And
+`tests/test_env_docs.py` derives its expectations from `config.py` rather than a
+hardcoded list, so a provider added later fails the suite instead of quietly
+going undocumented.
 
 ## Running it
 

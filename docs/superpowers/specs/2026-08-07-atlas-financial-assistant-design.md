@@ -1,5 +1,12 @@
 # Atlas — AI Financial Assistant for Telegram
 
+> **Historical document.** This is the design as written on 2026-08-07, before
+> any of it was built, and it is kept unedited as a record of what was intended.
+> It is not a description of the running system, and some of it did not survive
+> contact with production — most notably the hosting model: Atlas now runs on an
+> Azure VM under `systemd` rather than a free tier that sleeps. For current
+> behaviour see the [README](../../../README.md).
+
 **Design spec — 2026-08-07**
 
 Hackathon: Humanity Founders "Atlas AI Financial Assistant"

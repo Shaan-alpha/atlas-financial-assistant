@@ -1,5 +1,11 @@
 # Atlas Core Assistant Implementation Plan (Phase 1 of 2)
 
+> **Historical document — completed 2026-08-09.** Kept unedited as the record of
+> how Atlas was built. The checkboxes reflect the state at the end of Phase 1;
+> the code has moved on since, particularly around concurrency, model failover
+> and deployment. Treat the [README](../../../README.md) as the source of truth
+> for how the system behaves today.
+
 > **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
 
 **Goal:** Build a working Telegram financial assistant that converses naturally, remembers the user, answers finance questions from live sources with citations, and understands voice, images, PDFs, and Google Sheets.
