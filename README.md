@@ -11,10 +11,10 @@ An AI financial analyst that lives in Telegram.
 Atlas holds a conversation. It learns who you are as you talk, pulls live market data, reads the documents you send it, and speaks up on its own when something on your watchlist actually matters.
 
 - **Conversation only.** No slash commands, no inline buttons, no menus. Onboarding happens by talking.
-- **Live market data** (quotes, fundamentals, price history, earnings dates, SEC filings, and grounded news.
-- **Documents that keep their shape**) send a PDF, a spreadsheet, a Google Sheet link, or a photo of a chart.
-- **Voice** (send a voice note instead of typing.
-- **Memory that persists**) role, timezone, watchlist, and durable facts, across restarts.
+- **Live market data** — quotes, fundamentals, price history, earnings dates, SEC filings, and grounded news.
+- **Documents that keep their shape** — send a PDF, a spreadsheet, a Google Sheet link, or a photo of a chart.
+- **Voice** — send a voice note instead of typing.
+- **Memory that persists** — role, timezone, watchlist, and durable facts, across restarts.
 - **Proactive briefings and alerts**, including the decision *not* to send one.
 
 ## Five decisions worth reading the code for
@@ -101,21 +101,69 @@ the design does not make.
 
 Agentic core, deterministic edges. Gemini's automatic function calling runs the loop; there is no intent classifier to misroute a question.
 
+```mermaid
+flowchart TD
+    TG(["<b>Telegram</b><br/>text · voice note · photo · PDF · sheet"])
+
+    ING["<b>ingress/</b><br/>normalise every input shape<br/>voice → Groq Whisper large-v3-turbo<br/>documents &amp; images → handed to Gemini whole"]
+
+    LOCK["<b>engine/turnlock.py</b><br/>one lock per user, WeakValueDictionary<br/><i>different people run in parallel;<br/>one person's turns never overlap</i>"]
+
+    ENG["<b>engine/</b><br/>conversation loop · prompt assembly<br/>walks a model chain per workload"]
+
+    subgraph WORK ["Gemini automatic function calling — no intent classifier to misroute"]
+        direction LR
+        TOOLS["<b>tools/</b> · 20 tools<br/>quotes · fundamentals · comparisons<br/>price history · earnings · SEC filings<br/>grounded news · sheets · clarify<br/><i>each closure-bound to one user id</i>"]
+        MEM["<b>memory/</b><br/>profile · durable facts<br/>watchlist · conversation history"]
+    end
+
+    subgraph PRO ["proactive/ — the part that decides not to speak"]
+        direction TB
+        SCHED["<b>scheduler</b> · APScheduler<br/>briefings &amp; alert sweeps"]
+        SIG{"any signals<br/>at all?"}
+        GATE{"<b>salience gate</b><br/>push and pull run different<br/>instructions against the same body"}
+        SCHED --> SIG
+        SIG -->|"no"| SHORT(["short-circuit<br/><i>an empty morning costs nothing</i>"])
+        SIG -->|"yes"| GATE
+    end
+
+    SILENCE(["<b>silence</b><br/><i>malformed yes → silence<br/>gate failure → silence</i>"])
+    REPLY(["reply to the user"])
+
+    subgraph FAIL ["Failover, measured from the host"]
+        direction TB
+        Q["<b>quotes</b> · finnhub → fmp → yahoo<br/>→ alphavantage → yfinance"]
+        F["<b>fundamentals</b> · finnhub → fmp → yfinance"]
+        DIAG["<b>/diag</b> · provider health read from<br/>the running host, keys scrubbed"]
+    end
+
+    PG[("<b>Postgres 18</b> · SQLAlchemy 2.0 / psycopg3<br/>nightly pg_dump on a systemd timer")]
+    WD["<b>watchdog</b><br/>force-exits when the Application is up<br/>but the poller underneath has finished<br/><i>back polling 6 s after kill -9</i>"]
+
+    TG --> ING --> LOCK --> ENG
+    ENG --> TOOLS
+    ENG --> MEM
+    TOOLS --> Q
+    TOOLS --> F
+    Q -.-> DIAG
+    F -.-> DIAG
+    MEM <--> PG
+    TOOLS --> REPLY
+    GATE -->|"send: true"| REPLY
+    GATE -->|"send: false"| SILENCE
+    WD -.->|"systemd Restart=always"| ENG
+
+    classDef gate fill:#7f1d1d,stroke:#f87171,stroke-width:2px,color:#fee2e2
+    classDef quiet fill:#0f172a,stroke:#475569,stroke-width:1.5px,color:#94a3b8
+    classDef core fill:#312e81,stroke:#818cf8,stroke-width:2px,color:#e2e8f0
+    classDef store fill:#1e293b,stroke:#475569,stroke-width:1.5px,color:#cbd5e1
+    class GATE,SIG gate
+    class SILENCE,SHORT quiet
+    class ENG,TOOLS,MEM,LOCK core
+    class PG,Q,F,DIAG,WD store
 ```
-Telegram  ─→  ingress/     normalize text · voice · photo · document
-                 │
-                 ▼
-              engine/      conversation loop, model failover, prompt
-                 │
-      ┌──────────┼──────────┐
-      ▼          ▼          ▼
-   tools/     memory/    proactive/
-   20 tools   profile    salience gate
-   market     facts      briefings
-   filings    watchlist  alerts
-   news       history    scheduler
-   sheets
-```
+
+Read the red path first. Everything else is a conversation loop; the gate is the part that had to be code, because "only message when it matters" in a system prompt does not survive contact with a model that wants to be helpful.
 
 **20 tools**, each bound to one user by closure; the model never supplies a user id, so it cannot reach another user's data.
 
