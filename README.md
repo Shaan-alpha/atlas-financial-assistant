@@ -23,7 +23,7 @@ Atlas holds a conversation. It learns who you are as you talk, pulls live market
 
 Most PDF pipelines run `pypdf`, get a wall of text, and lose the tables, which in a financial filing is where the answer usually lives. A segment margin table flattens into an unlabelled column of numbers, and the model then confidently misreads it.
 
-Atlas uploads the file to Gemini directly ([`atlas/integrations/gemini.py`](atlas/integrations/gemini.py)) and lets native document understanding read the layout. Tables stay tables. Ask "which segment carried the quarter?" of a results PDF and it reads the margin column correctly rather than guessing from prose.
+Atlas uploads the file to Gemini directly ([`atlas/ingress/handlers.py`](atlas/ingress/handlers.py)) and lets native document understanding read the layout. Tables stay tables. Ask "which segment carried the quarter?" of a results PDF and it reads the margin column correctly rather than guessing from prose.
 
 The same path handles images, so a photographed chart works too.
 
