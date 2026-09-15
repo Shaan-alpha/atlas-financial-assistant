@@ -21,7 +21,12 @@ import logging
 
 from google.genai import types
 
-from atlas.integrations.gemini import EXTRACT_CHAIN, get_client, is_rate_limited
+from atlas.integrations.gemini import (
+    EXTRACT_CHAIN,
+    failover_reason,
+    get_client,
+    log_failover,
+)
 
 log = logging.getLogger(__name__)
 
@@ -98,8 +103,10 @@ def _decide_sync(prompt: str, instruction: str = PUSH_INSTRUCTION) -> dict:
             return json.loads(response.text or "{}")
         except Exception as exc:
             last = exc
-            if not is_rate_limited(exc):
+            reason = failover_reason(exc, model)
+            if reason is None:
                 raise
+            log_failover(log, model, reason, exc)
     raise last if last is not None else RuntimeError("no salience model configured")
 
 

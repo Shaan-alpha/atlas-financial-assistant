@@ -58,7 +58,7 @@ async def test_model_failure_returns_honest_message(monkeypatch):
 
     reply = await conversation.respond(uid, "hello")
 
-    assert "trouble" in reply.lower()
+    assert reply == conversation.FAILURE_REPLY
     # The failed turn must not be persisted as a model reply.
     assert [m["role"] for m in store.recent_messages(uid)] == ["user"]
 

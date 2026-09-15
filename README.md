@@ -78,6 +78,14 @@ two untried models still in the chain, and the user got an apology instead of a
 quote. Genuine faults still stop at the first model, since retrying a malformed
 request three times only makes someone wait three times as long to be told no.
 
+Models also do not live forever. Google retires them on its own schedule, and on
+2026-09-15 the last model in the chat chain began answering `404 NOT_FOUND`. The
+two live models ahead of it hit a `503` demand spike at the same moment, the 404
+was treated as a genuine fault, and the turn died. A 404 that names the requested
+model now counts as "retired": the chain skips it, logs it as an error because
+only a code change fixes it, and never spends the post-wait retry on it. Every
+chain (chat, news, fact extraction, the briefing gate) follows the same rule.
+
 ### 5. Concurrency is per-user ordered, not free-for-all
 
 Updates used to be processed strictly one at a time, so one slow turn (a PDF

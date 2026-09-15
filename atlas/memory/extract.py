@@ -7,7 +7,12 @@ import re
 
 from google.genai import types
 
-from atlas.integrations.gemini import EXTRACT_CHAIN, get_client, is_rate_limited
+from atlas.integrations.gemini import (
+    EXTRACT_CHAIN,
+    failover_reason,
+    get_client,
+    log_failover,
+)
 from atlas.memory import store
 
 log = logging.getLogger(__name__)
@@ -54,8 +59,10 @@ async def _extract(user_text: str, reply: str) -> list[dict]:
             return json.loads(response.text or "[]")
         except Exception as exc:
             last = exc
-            if not is_rate_limited(exc):
+            reason = failover_reason(exc, model)
+            if reason is None:
                 raise
+            log_failover(log, model, reason, exc)
     raise last if last is not None else RuntimeError("no extraction model configured")
 
 

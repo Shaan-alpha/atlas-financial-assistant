@@ -8,7 +8,12 @@ import logging
 
 from google.genai import types
 
-from atlas.integrations.gemini import GROUNDED_CHAIN, get_client, is_rate_limited
+from atlas.integrations.gemini import (
+    GROUNDED_CHAIN,
+    failover_reason,
+    get_client,
+    log_failover,
+)
 from atlas.tools.result import err, ok
 
 log = logging.getLogger(__name__)
@@ -35,9 +40,10 @@ def _generate_grounded(query: str):
             )
         except Exception as exc:
             last = exc
-            if not is_rate_limited(exc):
+            reason = failover_reason(exc, model)
+            if reason is None:
                 raise
-            log.warning("grounded model %s rate limited, trying next", model)
+            log_failover(log, model, reason, exc)
     raise last if last is not None else RuntimeError("no grounded model configured")
 
 
@@ -63,7 +69,10 @@ def search_financial_news(query: str) -> dict:
     """
     try:
         response = _generate_grounded(query)
-    except Exception:
+    except Exception as exc:
+        # The model gets an error result and answers without news, so the user
+        # sees nothing wrong. This line is the only trace that search is down.
+        log.warning("live news search failed: %s", exc)
         return err("search_unavailable", "Live search is not responding right now.")
 
     summary = (getattr(response, "text", "") or "").strip()

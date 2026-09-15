@@ -13,9 +13,11 @@ from atlas.engine import turnlock
 from atlas.engine.prompt import build_system_prompt
 from atlas.integrations.gemini import (
     CHAT_CHAIN,
+    failover_reason,
     get_client,
     is_rate_limited,
     is_transient,
+    log_failover,
     retry_after_seconds,
 )
 from atlas.memory import store
@@ -27,9 +29,15 @@ log = logging.getLogger(__name__)
 HISTORY_TURNS = 20
 MAX_REPLY_CHARS = 1400  # far below Telegram's 4096; concision is a requirement
 MAX_QUOTA_WAIT = 20.0  # seconds; beyond this a user would rather get an answer back
-FAILURE_REPLY = "I hit trouble reaching my data sources just then. Try me again?"
+# Tool failures go back to the model as results and never reach these replies,
+# so none of them may blame data sources: that sent the 2026-09-15 diagnosis
+# looking at healthy market-data APIs while the model chain was the fault.
+FAILURE_REPLY = "Something went wrong on my side just then. Try me again?"
 BUSY_REPLY = (
     "I'm being rate limited right now — give me about a minute and ask me again."
+)
+OVERLOADED_REPLY = (
+    "My AI model is overloaded right now — give me about a minute and ask me again."
 )
 EMPTY_REPLY = "I did not get that — could you say it another way?"
 
@@ -84,27 +92,35 @@ async def _generate_resilient(contents, system_prompt: str, tools: list):
     Free-tier quota is per model, so a 429 on the preferred model does not mean the
     next one is also exhausted. Transient upstream faults are also worth carrying
     to the next model — a 499 CANCELLED on the first request of a fresh process
-    used to abort the whole turn with two untried models still in the chain.
-    Anything else is a genuine fault: retrying it just wastes the user's time.
+    used to abort the whole turn with two untried models still in the chain. So is
+    a model Google has retired, which is skipped and never retried: waiting does
+    not bring it back. Anything else is a genuine fault: retrying it just wastes
+    the user's time.
     """
     last: Exception | None = None
+    # Models that refused for a reason a short wait can outlast, best first.
+    recoverable: list[tuple[str, Exception]] = []
 
     for model in CHAT_CHAIN:
         try:
             return await _generate(model, contents, system_prompt, tools)
         except Exception as exc:
             last = exc
-            if is_rate_limited(exc):
-                log.warning("%s rate limited, trying next model", model)
-            elif is_transient(exc):
-                log.warning("%s failed transiently (%s), trying next model", model, exc)
-            else:
+            reason = failover_reason(exc, model)
+            if reason is None:
                 raise
+            log_failover(log, model, reason, exc)
+            if reason != "retired":
+                recoverable.append((model, exc))
 
-    delay = min(retry_after_seconds(last) if last else 5.0, MAX_QUOTA_WAIT)
-    log.warning("all models rate limited; waiting %.1fs before one final attempt", delay)
+    if not recoverable:
+        raise last if last is not None else RuntimeError("no chat model configured")
+
+    model = recoverable[0][0]
+    delay = min(retry_after_seconds(recoverable[-1][1]), MAX_QUOTA_WAIT)
+    log.warning("no model answered; waiting %.1fs before one final try on %s", delay, model)
     await asyncio.sleep(delay)
-    return await _generate(CHAT_CHAIN[0], contents, system_prompt, tools)
+    return await _generate(model, contents, system_prompt, tools)
 
 
 def _load_turn(user_id: int, text: str):
@@ -145,8 +161,12 @@ async def _turn(
         )
     except Exception as exc:
         log.exception("generation failed for user %s", user_id)
-        # Quota is transient and self-healing; say so rather than implying a fault.
-        return BUSY_REPLY if is_rate_limited(exc) else FAILURE_REPLY
+        # Quota and overload are self-healing; say so rather than implying a fault.
+        if is_rate_limited(exc):
+            return BUSY_REPLY
+        if is_transient(exc):
+            return OVERLOADED_REPLY
+        return FAILURE_REPLY
 
     reply = (getattr(response, "text", "") or "").strip()
     if not reply:
