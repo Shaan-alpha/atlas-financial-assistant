@@ -11,7 +11,6 @@ import atlas.engine.conversation as conversation
 from atlas.integrations.gemini import (
     CHAT_CHAIN,
     EXTRACT_CHAIN,
-    GROUNDED_CHAIN,
     is_model_unavailable,
     is_rate_limited,
     is_transient,
@@ -125,7 +124,7 @@ async def test_quota_wait_is_capped(monkeypatch):
         "I cover semiconductors for a hedge fund",
         "my fund is long NVDA",
         "we're bearish on EV demand",
-        "Add Apple to the things you watch for me please and also track Microsoft too",
+        "Our desk runs a long/short book with a heavy tilt toward AI infrastructure names",
     ],
 )
 def test_durable_turns_trigger_extraction(text):
@@ -133,7 +132,17 @@ def test_durable_turns_trigger_extraction(text):
 
 
 @pytest.mark.parametrize(
-    "text", ["nvda price?", "compare msft and googl", "what moved today", ""]
+    "text",
+    [
+        "nvda price?",
+        "compare msft and googl",
+        "what moved today",
+        "",
+        "tell me about NVDA",
+        "how is the US market doing",
+        "what should I buy today?",
+        "I'm back.",
+    ],
 )
 def test_throwaway_turns_skip_extraction(text):
     assert looks_durable(text) is False
@@ -259,7 +268,7 @@ def test_a_retired_model_is_recognised_as_unavailable():
 
 
 @pytest.mark.parametrize(
-    "chain", [CHAT_CHAIN, GROUNDED_CHAIN, EXTRACT_CHAIN], ids=["chat", "grounded", "extract"]
+    "chain", [CHAT_CHAIN, EXTRACT_CHAIN], ids=["chat", "extract"]
 )
 def test_no_chain_leans_on_a_retired_model(chain):
     assert not set(chain) & RETIRED_MODELS
@@ -368,6 +377,115 @@ async def test_persistent_overload_tells_the_user_it_is_temporary(monkeypatch):
     assert reply == conversation.OVERLOADED_REPLY
 
 
+async def test_groq_answers_when_no_gemini_model_does(monkeypatch):
+    import atlas.engine.fallback as fallback
+
+    slept = []
+    seen = {}
+
+    async def _gemini(model, contents, system_prompt, tools):
+        raise _overloaded()
+
+    async def _groq(history, text, system_prompt, tools):
+        seen.update(text=text, tools={t.__name__ for t in tools}, prompt=system_prompt)
+        return "*NVDA* is at *$212.17*."
+
+    async def _record(seconds):
+        slept.append(seconds)
+
+    monkeypatch.setattr(conversation, "_generate", _gemini)
+    monkeypatch.setattr(fallback, "respond", _groq)
+    monkeypatch.setattr(conversation.asyncio, "sleep", _record)
+    uid = store.get_or_create_user(707, "Shaan")
+
+    reply = await conversation.respond(uid, "today nvidia stocks")
+
+    assert reply == "*NVDA* is at *$212.17*."
+    assert slept == [], "a second provider answering beats waiting on the first"
+    assert seen["text"] == "today nvidia stocks"
+    assert "get_quote" in seen["tools"]
+    assert "Atlas" in seen["prompt"]
+    # The fallback's reply is part of the conversation like any other.
+    assert [m["role"] for m in store.recent_messages(uid)] == ["user", "model"]
+
+
+async def test_turns_with_attachments_never_go_to_groq(monkeypatch):
+    """Uploaded files live in Gemini's Files API; no other provider can read them."""
+    import atlas.engine.fallback as fallback
+
+    tried = []
+
+    async def _gemini(model, contents, system_prompt, tools):
+        tried.append(model)
+        if len(tried) <= len(CHAT_CHAIN):
+            raise _overloaded()
+        return _Answer("The chart shows a breakout.")
+
+    async def _groq(*args):
+        raise AssertionError("an image turn must not reach groq")
+
+    async def _no_sleep(_seconds):
+        return None
+
+    monkeypatch.setattr(conversation, "_generate", _gemini)
+    monkeypatch.setattr(fallback, "respond", _groq)
+    monkeypatch.setattr(conversation.asyncio, "sleep", _no_sleep)
+    uid = store.get_or_create_user(708, "Shaan")
+
+    reply = await conversation.respond(
+        uid, "what is this chart?", [{"kind": "image", "bytes": b"x", "mime": "image/jpeg"}]
+    )
+
+    assert reply == "The chart shows a breakout."
+
+
+async def test_a_failed_fallback_still_waits_and_retries_gemini(monkeypatch):
+    import atlas.engine.fallback as fallback
+
+    tried = []
+    slept = []
+
+    async def _gemini(model, contents, system_prompt, tools):
+        tried.append(model)
+        if len(tried) <= len(CHAT_CHAIN):
+            raise _overloaded()
+        return _Answer("back on gemini")
+
+    async def _groq(*args):
+        raise ConnectionError("groq down too")
+
+    async def _record(seconds):
+        slept.append(seconds)
+
+    monkeypatch.setattr(conversation, "_generate", _gemini)
+    monkeypatch.setattr(fallback, "respond", _groq)
+    monkeypatch.setattr(conversation.asyncio, "sleep", _record)
+    uid = store.get_or_create_user(709, "Shaan")
+
+    assert await conversation.respond(uid, "hello") == "back on gemini"
+    assert len(slept) == 1
+
+
+def test_the_briefing_gate_falls_back_to_groq(monkeypatch):
+    """A briefing the gate could not decide on is a briefing that never arrives."""
+    import atlas.engine.fallback as fallback
+    from atlas.proactive import salience
+
+    class _Models:
+        def generate_content(self, model, contents, config):
+            raise _overloaded()
+
+    class _Client:
+        models = _Models()
+
+    monkeypatch.setattr(salience, "get_client", lambda: _Client())
+    monkeypatch.setattr(
+        fallback, "complete_json", lambda system, prompt: {"send": True, "brief": "*AMD* -4%"}
+    )
+
+    assert salience._decide_sync("{}")["brief"] == "*AMD* -4%"
+
+
 def test_no_failure_reply_blames_data_sources():
     """Tool failures go back to the model as results and never reach these
     replies, so naming data sources sends whoever reads it the wrong way."""
@@ -381,49 +499,8 @@ def test_no_failure_reply_blames_data_sources():
 
 # --- the other chains ---------------------------------------------------------
 #
-# News, fact extraction, and the briefing gate each walk their own chain, and
-# each used to fail over on quota alone. A 503 or a retired model ended them.
-
-
-@pytest.mark.parametrize("fault", [_overloaded, _retired], ids=["overloaded", "retired"])
-def test_grounded_news_fails_over(monkeypatch, fault):
-    import atlas.tools.news as news
-
-    tried = []
-
-    class _Models:
-        def generate_content(self, model, contents, config):
-            tried.append(model)
-            if len(tried) == 1:
-                raise fault(model) if fault is _retired else fault()
-            return _Answer("Nvidia fell 2%.")
-
-    class _Client:
-        models = _Models()
-
-    monkeypatch.setattr(news, "get_client", lambda: _Client())
-
-    result = news.search_financial_news("why did nvidia move")
-
-    assert result["ok"] is True
-    assert tried == list(GROUNDED_CHAIN[:2])
-
-
-def test_a_failed_news_search_is_logged(monkeypatch, caplog):
-    """It used to return an error to the model and log nothing, so live news
-    could be down for weeks without a single line in the journal."""
-    import atlas.tools.news as news
-
-    def _boom(query):
-        raise ValueError("malformed request")
-
-    monkeypatch.setattr(news, "_generate_grounded", _boom)
-
-    with caplog.at_level("WARNING", logger="atlas.tools.news"):
-        result = news.search_financial_news("q")
-
-    assert result["ok"] is False
-    assert "malformed request" in caplog.text
+# Fact extraction and the briefing gate each walk their own chain, and each used
+# to fail over on quota alone. A 503 or a retired model ended them.
 
 
 @pytest.mark.parametrize("fault", [_overloaded, _retired], ids=["overloaded", "retired"])
@@ -482,3 +559,22 @@ def test_the_briefing_gate_fails_over(monkeypatch, fault):
 
     assert raw["send"] is True
     assert tried == list(EXTRACT_CHAIN[:2])
+
+
+def test_the_gemini_client_never_waits_forever(env):
+    """A hung request held the user's turn lock indefinitely."""
+    import atlas.integrations.gemini as gemini
+
+    gemini.get_client.cache_clear()
+    try:
+        client = gemini.get_client()
+        assert client._api_client._http_options.timeout == gemini.REQUEST_TIMEOUT_MS
+    finally:
+        gemini.get_client.cache_clear()
+
+
+def test_a_client_side_timeout_moves_to_the_next_model():
+    import httpx
+
+    assert is_transient(httpx.ReadTimeout("timed out")) is True
+    assert is_transient(TimeoutError()) is True

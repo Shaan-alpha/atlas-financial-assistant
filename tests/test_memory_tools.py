@@ -90,3 +90,77 @@ def test_recall_surfaces_the_watchlist():
     assert recall()["data"]["watchlist"] == [
         {"symbol": "MSFT", "company": "Microsoft"}
     ]
+
+
+# --- audit fixes, 2026-09-16 -----------------------------------------------------
+
+
+def test_forget_about_needs_a_topic():
+    """An empty topic used to be an ILIKE '%%' that deleted every fact."""
+    uid = store.get_or_create_user(90, "Dev")
+    t = tools(uid)
+    t["remember"]("Covers semiconductors", "focus")
+
+    result = t["forget_about"]("  ")
+
+    assert result["ok"] is False
+    assert result["error"] == "need_topic"
+    assert len(t["recall"]()["data"]["facts"]) == 1
+
+
+def test_forget_about_says_what_it_removed():
+    uid = store.get_or_create_user(91, "Dev")
+    t = tools(uid)
+    t["remember"]("Bearish on EV demand", "view")
+
+    assert t["forget_about"]("EV")["data"]["removed_facts"] == ["Bearish on EV demand"]
+
+
+def test_a_long_role_does_not_lose_the_briefing_time():
+    """Postgres rejected a role over 80 characters and the rollback took the
+    briefing time and timezone saved in the same call down with it."""
+    uid = store.get_or_create_user(92, "Dev")
+
+    result = tools(uid)["update_profile"](
+        role="portfolio manager " * 10, timezone="Asia/Kolkata", briefing_time="08:30"
+    )
+
+    assert result["ok"] is True
+    profile = store.profile_snapshot(uid)
+    assert profile["briefing_time"] == "08:30"
+    assert len(profile["role"]) <= 80
+
+
+@pytest.mark.parametrize(
+    "call",
+    [
+        lambda t: t["update_profile"](briefing_time="08:30"),
+        lambda t: t["add_to_watchlist"]("NVDA"),
+    ],
+    ids=["briefing-time", "watchlist"],
+)
+def test_onboarding_ends_once_the_user_gives_anything_durable(call):
+    """Only a role used to end onboarding, so someone who skipped it was greeted
+    as a stranger on every turn forever."""
+    uid = store.get_or_create_user(93, "Dev")
+
+    call(tools(uid))
+
+    assert store.profile_snapshot(uid)["onboarding_state"] == "done"
+
+
+def test_the_watchlist_is_capped(monkeypatch):
+    import atlas.tools.memory_tools as memory_tools
+
+    monkeypatch.setattr(memory_tools, "MAX_WATCHLIST", 2)
+    uid = store.get_or_create_user(94, "Dev")
+    t = tools(uid)
+    t["add_to_watchlist"]("NVDA")
+    t["add_to_watchlist"]("AMD")
+
+    result = t["add_to_watchlist"]("TSLA")
+
+    assert result["ok"] is False
+    assert result["error"] == "watchlist_full"
+    # Re-adding a name already there is not growth and must still succeed.
+    assert t["add_to_watchlist"]("NVDA")["ok"] is True

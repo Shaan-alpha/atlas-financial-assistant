@@ -1,11 +1,15 @@
 from datetime import datetime, timezone
 
-from sqlalchemy import Boolean, DateTime, Float, ForeignKey, Integer, String, Text
+from sqlalchemy import BigInteger, Boolean, DateTime, Float, ForeignKey, String, Text
 from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column
 
 
 def _utcnow() -> datetime:
-    return datetime.now(timezone.utc)
+    # Naive UTC, because these columns are TIMESTAMP WITHOUT TIME ZONE: psycopg
+    # binds an aware datetime as timestamptz, which Postgres then converts using
+    # the session's timezone. Storing what the code compares against keeps the
+    # two halves honest on a database that is not set to UTC.
+    return datetime.now(timezone.utc).replace(tzinfo=None)
 
 
 class Base(DeclarativeBase):
@@ -16,7 +20,10 @@ class User(Base):
     __tablename__ = "users"
 
     id: Mapped[int] = mapped_column(primary_key=True)
-    telegram_id: Mapped[int] = mapped_column(Integer, unique=True, index=True)
+    # 64-bit: Telegram user ids passed 2**31 long ago, and a 32-bit column made
+    # every newer account crash on its first message. atlas.db.session widens an
+    # existing production column at startup.
+    telegram_id: Mapped[int] = mapped_column(BigInteger, unique=True, index=True)
     name: Mapped[str | None] = mapped_column(String(120), default=None)
     role: Mapped[str | None] = mapped_column(String(80), default=None)
     timezone: Mapped[str] = mapped_column(String(64), default="UTC")

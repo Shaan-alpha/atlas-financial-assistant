@@ -21,6 +21,7 @@ import logging
 
 from google.genai import types
 
+from atlas.engine import fallback
 from atlas.integrations.gemini import (
     EXTRACT_CHAIN,
     failover_reason,
@@ -44,22 +45,13 @@ costs you nothing.
 If nothing clears that bar, return {"send": false, "brief": "", "used_keys": []}.
 """
 
-PULL_PREAMBLE = """\
-The user has just ASKED what is happening with the names they follow. Answer them.
-
-The bar is different from an unprompted alert: they want to know, so report
-anything genuinely notable rather than only what would justify interrupting them.
-A meaningful move on a name they follow qualifies.
-
-Return {"send": false, ...} only when truly nothing has moved and there is no
-news at all — never to avoid bothering someone who asked.
-"""
-
 _BODY = """\
 If something is worth reporting, write the briefing:
 - Open with the single most important thing. No greeting, no preamble.
 - 6 lines maximum. One line per item.
 - EVERY item says why it matters to THIS user, given their role and interests.
+- A move may carry headlines. Use them to say what was reported, naming the
+  outlet. If none of them explains the move, say only that it moved; never guess.
 - Telegram markdown only: *bold* with single asterisks. No headings or tables.
 - Use only numbers present in the data. Never invent or estimate a figure.
 - Mention index levels only if they add to a signal you are already reporting.
@@ -68,7 +60,6 @@ Return JSON: {"send": bool, "brief": string, "used_keys": [signal keys used]}
 """
 
 PUSH_INSTRUCTION = PUSH_PREAMBLE + "\n" + _BODY
-PULL_INSTRUCTION = PULL_PREAMBLE + "\n" + _BODY
 
 
 def _payload(profile: dict, facts: list[dict], signals: list[dict], context) -> str:
@@ -87,8 +78,7 @@ def _payload(profile: dict, facts: list[dict], signals: list[dict], context) -> 
 
 
 def _decide_sync(prompt: str, instruction: str = PUSH_INSTRUCTION) -> dict:
-    """The actual model call. Synchronous so it can serve both the scheduled
-    briefing and the on-demand tool, which runs inside a sync tool call."""
+    """The actual model call, run off the loop by _decide."""
     last: Exception | None = None
     for model in EXTRACT_CHAIN:
         try:
@@ -107,6 +97,13 @@ def _decide_sync(prompt: str, instruction: str = PUSH_INSTRUCTION) -> dict:
             if reason is None:
                 raise
             log_failover(log, model, reason, exc)
+
+    # A gate that cannot decide stays silent, which on a bad morning for Gemini
+    # would silence every briefing at once. A second provider decides instead.
+    try:
+        return fallback.complete_json(instruction, prompt)
+    except Exception as exc:
+        log.warning("groq could not decide the briefing either: %s", exc)
     raise last if last is not None else RuntimeError("no salience model configured")
 
 
@@ -125,26 +122,6 @@ def _verdict_from(raw: dict, signals: list[dict]) -> dict:
         "brief": brief,
         "used_keys": raw.get("used_keys") or [s["key"] for s in signals],
     }
-
-
-def decide_sync(
-    profile: dict, facts: list[dict], signals: list[dict], context: dict | None
-) -> dict:
-    """Synchronous gate for the on-demand tool.
-
-    Uses the pull instruction: the user asked, so the bar is "is this notable"
-    rather than "does this justify interrupting them".
-    """
-    if not signals:
-        return SILENT
-    try:
-        raw = _decide_sync(
-            _payload(profile, facts, signals, context), PULL_INSTRUCTION
-        )
-    except Exception:
-        log.exception("salience gate failed; staying silent")
-        return SILENT
-    return _verdict_from(raw, signals)
 
 
 async def decide(

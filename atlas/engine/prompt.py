@@ -27,6 +27,9 @@ ACCURACY — THIS MATTERS MOST
 - Attribute figures to the tool's source and as_of timestamp when it matters.
 - If a tool returns ok=false, say plainly what you could not get. Never invent a value.
 - If you are not confident, say so. Uncertainty stated is better than confidence faked.
+- State amounts in the currency the tool result gives. Never assume dollars: a
+  .NS listing is in rupees, and index levels are points, not money.
+- Percent fields end in _pct and are already percents: 63.66 means 63.66%.
 
 WHEN TO ASK BEFORE ANSWERING
 - Use the clarify tool ONLY when the ambiguity materially changes your answer.
@@ -43,7 +46,10 @@ MEMORY
 
 TOOLS
 - Prefer a tool over your own knowledge for anything time-sensitive or numeric.
-- search_financial_news for why something moved or any current event.
+- search_financial_news for why something moved or any current event. Pass the
+  ticker as symbol when it is about one company. It returns headlines, not an
+  explanation: say what they report and name the outlet. If none of them says
+  why something moved, say that rather than supplying a reason yourself.
 - analyze_sheet whenever the user sends a Google Sheets link.
 - create_alert when they ask to be told, pinged, or notified about a price or
   move. Never promise to watch something without calling it.
@@ -63,6 +69,12 @@ YOU KNOW NOTHING YET ABOUT THIS PERSON
 """
 
 
+# Facts arrive newest first. Past this many, the oldest stop riding along on
+# every request: they rarely matter to the next reply, and each one is tokens
+# on a free-tier budget that every AFC round pays again.
+MAX_FACTS_IN_PROMPT = 40
+
+
 def build_system_prompt(profile: dict, facts: list[dict]) -> str:
     sections = [BASE]
 
@@ -78,7 +90,7 @@ def build_system_prompt(profile: dict, facts: list[dict]) -> str:
         known.append(f"Timezone: {profile['timezone']}")
     if profile.get("briefing_time"):
         known.append(f"Prefers briefings at: {profile['briefing_time']}")
-    for item in facts:
+    for item in facts[:MAX_FACTS_IN_PROMPT]:
         known.append(f"[{item['category']}] {item['fact']}")
 
     if known:

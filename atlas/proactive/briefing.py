@@ -71,32 +71,25 @@ async def build(user_id: int, tz_name: str) -> str | None:
 
 
 def build_now(user_id: int, tz_name: str) -> dict:
-    """Build a briefing because the user asked for one, right now.
+    """Gather a briefing's raw material because the user asked, right now.
 
-    Differs from the scheduled path in two ways, both deliberate:
+    Differs from the scheduled path, deliberately:
 
-    - It always returns something to say. Silence is the correct answer to
-      "should I interrupt them?", but not to "tell me what's going on".
+    - No gate and no model call of its own. Silence is the right answer to
+      "should I interrupt them?", not to "tell me what's going on", and the chat
+      model asking for this already knows the user. A separate model call here
+      only wrote prose for the chat model to rewrite, on a shared key.
     - It does not mark signals as sent. The dedupe ledger exists so the assistant
       never *interrupts* twice with the same item; a pull is not an interruption,
       and consuming the ledger here would silence tomorrow's briefing.
     """
-    today = local_today(tz_name)
-
-    signals = gather.gather(user_id, today)
-    if not signals:
-        return {"has_news": False, "brief": None, "signals_considered": 0}
-
-    verdict = salience.decide_sync(
-        store.profile_snapshot(user_id),
-        store.all_facts(user_id),
-        signals,
-        gather.market_context(),
-    )
+    signals = gather.gather(user_id, local_today(tz_name))
     return {
-        "has_news": verdict["send"],
-        "brief": verdict["brief"] or None,
-        "signals_considered": len(signals),
+        "has_news": bool(signals),
+        "signals": [
+            {"kind": s["kind"], "summary": s["summary"], "detail": s["detail"]}
+            for s in signals
+        ],
     }
 
 

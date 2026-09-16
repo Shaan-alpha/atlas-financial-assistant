@@ -178,3 +178,215 @@ def test_probe_output_is_scrubbed(monkeypatch):
     report = md.probe("AAPL")
 
     assert "LEAKED_KEY_HERE" not in str(report)
+
+
+# --- provider mappings, checked against live responses on 2026-09-16 -------------
+
+import httpx  # noqa: E402
+
+
+class _Http:
+    """Serves canned JSON by URL substring and records every request."""
+
+    def __init__(self, routes):
+        self.routes, self.calls = routes, []
+
+    def get(self, url, params=None):
+        self.calls.append((url, dict(params or {})))
+        request = httpx.Request("GET", url)
+        for fragment, (status, body) in self.routes.items():
+            if fragment in url:
+                return httpx.Response(status, json=body, request=request)
+        raise AssertionError(f"unexpected request to {url}")
+
+
+@pytest.fixture
+def keys(monkeypatch):
+    for name in ("FINNHUB_API_KEY", "FMP_API_KEY", "ALPHAVANTAGE_API_KEY"):
+        monkeypatch.setenv(name, f"{name.lower()}-value")
+    from atlas.config import get_settings
+
+    get_settings.cache_clear()
+    yield
+    get_settings.cache_clear()
+
+
+def _serve(monkeypatch, routes):
+    http = _Http(routes)
+    monkeypatch.setattr(md, "_http", lambda: http)
+    return http
+
+
+YAHOO_NVDA_1D = {
+    "chart": {"result": [{"meta": {
+        "regularMarketPrice": 212.17, "chartPreviousClose": 210.96, "previousClose": None,
+        "regularMarketTime": 1789502401, "currency": "USD",
+        "exchangeTimezoneName": "America/New_York", "shortName": "NVIDIA Corporation",
+    }}]}
+}
+
+
+def test_yahoo_daily_change_is_one_session(monkeypatch):
+    """Over range=2d, chartPreviousClose was 218.29, two sessions back; the real
+    previous close was 210.96."""
+    http = _serve(monkeypatch, {"finance.yahoo.com": (200, YAHOO_NVDA_1D)})
+
+    quote = md.yahoo_quote("NVDA")
+
+    assert http.calls[0][1]["range"] == "1d"
+    assert quote["previous_close"] == 210.96
+    assert round(quote["change_pct"], 2) == 0.57
+    assert quote["as_of"] == "2026-09-15T20:00:01Z"
+    assert quote["session_date"] == "2026-09-15"
+
+
+def test_finnhub_quote_carries_its_trade_time(monkeypatch, keys):
+    _serve(monkeypatch, {"finnhub.io/api/v1/quote": (200, {"c": 212.17, "pc": 210.96, "t": 1789502400})})
+
+    quote = md.finnhub_quote("NVDA")
+
+    assert quote["session_date"] == "2026-09-15"
+    assert quote["currency"] == "USD"
+
+
+def test_a_symbol_yahoo_does_not_know_stops_the_chain(monkeypatch, keys):
+    """A typo used to fall through to Alpha Vantage, spending one of its 25
+    requests a day on a listing that does not exist."""
+    http = _serve(monkeypatch, {
+        "finnhub.io": (200, {"c": 0}),
+        "financialmodelingprep.com": (200, []),
+        "finance.yahoo.com": (404, {"chart": {"result": None, "error": {"code": "Not Found"}}}),
+    })
+
+    assert md.fetch_quote("ZZZZQ") is None
+    assert not [url for url, _ in http.calls if "alphavantage" in url]
+
+
+def test_non_us_listings_skip_the_us_only_providers(monkeypatch, keys):
+    """Finnhub's free tier answers 403 for them, and FMP and Alpha Vantage
+    hardcoded a USD currency onto rupee prices."""
+    rel = {"chart": {"result": [{"meta": {
+        "regularMarketPrice": 1235.3, "chartPreviousClose": 1240.0, "currency": "INR",
+        "regularMarketTime": 1789502401, "exchangeTimezoneName": "Asia/Kolkata",
+    }}]}}
+    http = _serve(monkeypatch, {"finance.yahoo.com": (200, rel)})
+
+    quote = md.fetch_quote("reliance.ns")
+
+    assert quote["currency"] == "INR"
+    assert [url.split("/")[2] for url, _ in http.calls] == ["query1.finance.yahoo.com"]
+
+
+def test_indices_go_to_fmp_but_never_to_alpha_vantage(monkeypatch, keys):
+    http = _serve(monkeypatch, {
+        "financialmodelingprep.com": (200, []),
+        "finance.yahoo.com": (200, YAHOO_NVDA_1D),
+    })
+
+    quote = md.fetch_quote("^GSPC")
+
+    hosts = [url.split("/")[2] for url, _ in http.calls]
+    assert "finnhub.io" not in hosts and "www.alphavantage.co" not in hosts
+    assert "financialmodelingprep.com" in hosts
+    assert quote["currency"] is None  # index levels are points
+
+
+FINNHUB_PROFILE = {"currency": "USD", "marketCapitalization": 5084135.84, "name": "NVIDIA Corp",
+                   "finnhubIndustry": "Semiconductors"}
+FINNHUB_METRIC = {"metric": {"peTTM": 26.2005, "peBasicExclExtraTTM": 26.2005, "forwardPE": 18.10034,
+                             "netProfitMarginTTM": 63.66, "revenueGrowthTTMYoy": 83.38,
+                             "dividendYieldIndicatedAnnual": 0.03349}}
+
+
+def test_finnhub_fundamentals_are_labelled_truthfully(monkeypatch, keys):
+    _serve(monkeypatch, {
+        "stock/profile2": (200, FINNHUB_PROFILE),
+        "stock/metric": (200, FINNHUB_METRIC),
+    })
+
+    data = md.finnhub_fundamentals("NVDA")
+
+    assert data["trailing_pe"] == 26.2005
+    # Was peBasicExclExtraTTM, a trailing multiple, reported as forward.
+    assert data["forward_pe"] == 18.10034
+    # Percents stay percents, and say so in the key.
+    assert data["profit_margin_pct"] == 63.66
+    assert data["revenue_growth_pct"] == 83.38
+    assert data["dividend_yield_pct"] == 0.03349
+    assert data["currency"] == "USD"
+    assert "profit_margin" not in data and "dividend_yield" not in data
+
+
+def test_fmp_dividend_is_turned_into_a_yield(monkeypatch, keys):
+    """lastDividend is dollars per share; Coca-Cola's 2.1 read as a 2.1 yield."""
+    _serve(monkeypatch, {"stable/profile": (200, [{
+        "companyName": "The Coca-Cola Company", "price": 88.71, "lastDividend": 2.1,
+        "currency": "USD", "marketCap": 381679115935, "sector": "Consumer Defensive",
+    }])})
+
+    data = md.fmp_fundamentals("KO")
+
+    assert data["dividend_per_share"] == 2.1
+    assert round(data["dividend_yield_pct"], 2) == 2.37
+
+
+def test_yahoo_history_keeps_the_close_before_the_window(monkeypatch):
+    body = {"chart": {"result": [{
+        "meta": {"chartPreviousClose": 225.73, "currency": "USD",
+                 "exchangeTimezoneName": "America/New_York"},
+        "timestamp": [1789392600, 1789479000, 1789565400],
+        "indicators": {"quote": [{"close": [210.96, 212.17, None],
+                                  "high": [219.0, 213.94, None], "low": [209.1, 211.16, None]}]},
+    }]}}
+    _serve(monkeypatch, {"finance.yahoo.com": (200, body)})
+
+    history = md.fetch_history("NVDA", "5d")
+
+    assert history["previous_close"] == 225.73
+    # A null close (a holiday, or the session still open) is skipped, not zeroed.
+    assert [r["date"] for r in history["rows"]] == ["2026-09-14", "2026-09-15"]
+
+
+def test_finnhub_earnings_reads_the_free_calendar(monkeypatch, keys):
+    _serve(monkeypatch, {"calendar/earnings": (200, {"earningsCalendar": [
+        {"symbol": "NVDA", "date": "2026-11-17", "hour": "amc", "epsEstimate": 2.5231,
+         "revenueEstimate": 111273704778},
+    ]})})
+
+    data = md.finnhub_earnings("NVDA")
+
+    assert data["dates"] == ["2026-11-17"]
+    assert data["timing"] == "after the close"
+    assert data["eps_estimate"] == 2.5231
+
+
+def test_provider_failures_are_logged_without_keys(monkeypatch, keys, caplog):
+    def _leaky(symbol):
+        raise RuntimeError("403 for url 'https://x.test/q?symbol=A&apikey=finnhub_api_key-value'")
+
+    monkeypatch.setattr(md, "QUOTE_PROVIDERS", (("leaky", _leaky),))
+
+    with caplog.at_level("DEBUG", logger="atlas.integrations.marketdata"):
+        md.fetch_quote("AAPL")
+
+    assert "finnhub_api_key-value" not in caplog.text
+
+
+def test_a_routine_probe_spares_the_daily_capped_providers(monkeypatch):
+    called = []
+
+    def _spy(name):
+        def provider(symbol):
+            called.append(name)
+            return None
+
+        return provider
+
+    monkeypatch.setattr(md, "QUOTE_PROVIDERS", tuple((n, _spy(n)) for n in ("finnhub", "alphavantage")))
+    monkeypatch.setattr(md, "FUNDAMENTAL_PROVIDERS", (("yfinance", _spy("yfinance")),))
+
+    md.probe("AAPL")
+    assert called == ["finnhub"]
+
+    md.probe("AAPL", include_limited=True)
+    assert called == ["finnhub", "finnhub", "alphavantage", "yfinance"]

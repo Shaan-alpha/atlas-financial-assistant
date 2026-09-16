@@ -16,7 +16,9 @@ import logging
 import re
 from functools import lru_cache
 
+import httpx
 from google import genai
+from google.genai import types
 
 from atlas.config import get_settings
 
@@ -25,21 +27,28 @@ log = logging.getLogger(__name__)
 # Ordered best-first. Each entry is an independent quota bucket. Stable releases
 # sit ahead of previews, which Google retires sooner.
 CHAT_CHAIN = ("gemini-3.6-flash", "gemini-3.5-flash", "gemini-3-flash-preview")
-# Kept to two: grounding quota is shared across every Gemini 3 model, so a third
-# entry would mostly spend another request confirming the same refusal.
-GROUNDED_CHAIN = ("gemini-3-flash-preview", "gemini-3.6-flash")
 EXTRACT_CHAIN = ("gemini-3.1-flash-lite", "gemini-3.5-flash-lite")
+# No grounded chain: search grounding answers 429 on every Gemini 3 model for a
+# free key, so live news comes from free headline feeds (atlas/tools/news.py).
 
 # Kept for readability at call sites that only need the preferred model.
 MODEL_CHAT = CHAT_CHAIN[0]
-MODEL_GROUNDED = GROUNDED_CHAIN[0]
 
 _RETRY_SECONDS = re.compile(r"retryDelay['\"]?:\s*['\"]?(\d+)")
 
 
+# Per HTTP request, in milliseconds. Without one, a request that never answers
+# holds that user's turn lock forever, and every later message from them queues
+# behind it. Long enough for a document upload or a slow multimodal answer.
+REQUEST_TIMEOUT_MS = 90_000
+
+
 @lru_cache(maxsize=1)
 def get_client() -> genai.Client:
-    return genai.Client(api_key=get_settings().gemini_api_key)
+    return genai.Client(
+        api_key=get_settings().gemini_api_key,
+        http_options=types.HttpOptions(timeout=REQUEST_TIMEOUT_MS),
+    )
 
 
 def is_rate_limited(exc: Exception) -> bool:
@@ -68,6 +77,9 @@ def is_transient(exc: Exception) -> bool:
     faults that happen to mention it.
     """
     if getattr(exc, "code", None) in _TRANSIENT_CODES:
+        return True
+    # A request that timed out on our side says nothing about the next model.
+    if isinstance(exc, (httpx.TimeoutException, httpx.TransportError, TimeoutError)):
         return True
     text = str(exc)
     return any(status in text for status in _TRANSIENT_STATUSES)

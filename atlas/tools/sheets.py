@@ -2,6 +2,7 @@
 
 import csv
 import io
+import itertools
 import re
 
 import httpx
@@ -9,7 +10,13 @@ import httpx
 from atlas.tools.result import err, ok
 
 SOURCE = "Google Sheets (CSV export)"
-MAX_ROWS = 500
+# Read at most this much of the export. The whole file used to be downloaded and
+# parsed before anything was cut, on a 1 GiB machine.
+MAX_BYTES = 2 * 1024 * 1024
+MAX_ROWS = 500  # rows the numeric summary covers
+ROWS_RETURNED = 100  # raw rows handed to the model, which re-reads them every AFC round
+MAX_COLUMNS = 30
+MAX_CELL_CHARS = 200
 
 _SHEET_RE = re.compile(r"docs\.google\.com/spreadsheets/d/([a-zA-Z0-9-_]+)")
 _GID_RE = re.compile(r"[#&]gid=([0-9]+)")
@@ -28,12 +35,37 @@ def _fetch_csv(sheet_id: str, gid: str) -> str:
     export = (
         f"https://docs.google.com/spreadsheets/d/{sheet_id}/export?format=csv&gid={gid}"
     )
-    resp = httpx.get(export, timeout=30, follow_redirects=True)
-    if resp.status_code in (401, 403) or "text/html" in resp.headers.get("content-type", ""):
-        # Google serves a sign-in HTML page rather than a 403 for private sheets.
-        raise PermissionError
-    resp.raise_for_status()
-    return resp.text
+    with httpx.stream("GET", export, timeout=30, follow_redirects=True) as resp:
+        if resp.status_code in (401, 403) or "text/html" in resp.headers.get("content-type", ""):
+            # Google serves a sign-in HTML page rather than a 403 for private sheets.
+            raise PermissionError
+        resp.raise_for_status()
+        chunks, size = [], 0
+        for chunk in resp.iter_bytes():
+            chunks.append(chunk)
+            size += len(chunk)
+            if size >= MAX_BYTES:
+                break
+    return b"".join(chunks)[:MAX_BYTES].decode("utf-8", errors="replace")
+
+
+_NOISE = re.compile(r"[\s,$€£₹¥%]")
+
+
+def _parse_number(cell) -> float | None:
+    """A number as a finance sheet writes it: "$1,234", "12.5%", or "(1,234)"
+    for a negative. Plain float() skipped all three, skewing min and mean."""
+    if not isinstance(cell, str):
+        return None
+    text = _NOISE.sub("", cell).replace("\u2212", "-")
+    negative = text.startswith("(") and text.endswith(")")
+    if negative:
+        text = text[1:-1]
+    try:
+        value = float(text)
+    except ValueError:
+        return None
+    return -value if negative else value
 
 
 def _numeric_summary(headers: list[str], rows: list[list[str]]) -> dict:
@@ -43,10 +75,9 @@ def _numeric_summary(headers: list[str], rows: list[list[str]]) -> dict:
         for row in rows:
             if index >= len(row):
                 continue
-            try:
-                values.append(float(row[index].replace(",", "").strip()))
-            except (ValueError, AttributeError):
-                continue
+            value = _parse_number(row[index])
+            if value is not None:
+                values.append(value)
         if len(values) >= 2:
             summary[header] = {
                 "min": min(values),
@@ -80,7 +111,16 @@ def analyze_sheet(url: str) -> dict:
     except Exception:
         return err("sheet_unavailable", "Could not read that sheet right now.")
 
-    table = list(csv.reader(io.StringIO(raw)))
+    # One row past the limit is enough to know the sheet was cut.
+    table = [
+        [cell[:MAX_CELL_CHARS] for cell in row[:MAX_COLUMNS]]
+        for row in itertools.islice(csv.reader(io.StringIO(raw)), MAX_ROWS + 2)
+    ]
+    cut = len(raw.encode()) >= MAX_BYTES
+    if cut and len(table) > 1:
+        # The download stopped mid-row, so its last cell is half a value. Summing
+        # it would invent a number that is nowhere in the user's sheet.
+        table.pop()
     if not table:
         return err("empty_sheet", "That sheet has no data in it.")
 
@@ -88,9 +128,10 @@ def analyze_sheet(url: str) -> dict:
     return ok(
         {
             "headers": headers,
-            "rows": rows,
+            "rows": rows[:ROWS_RETURNED],
             "row_count": len(rows),
-            "truncated": len(table) - 1 > MAX_ROWS,
+            "rows_returned": min(len(rows), ROWS_RETURNED),
+            "truncated": len(table) - 1 > MAX_ROWS or cut,
             "numeric_summary": _numeric_summary(headers, rows),
         },
         source=SOURCE,

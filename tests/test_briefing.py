@@ -60,6 +60,66 @@ def test_notable_moves_become_signals(monkeypatch):
     assert signals[0]["key"] == f"move:NVDA:{TODAY}"
 
 
+def test_a_notable_move_carries_the_headlines_behind_it(monkeypatch):
+    """"NVDA down 6%" tells a user nothing they could not see on a ticker. The
+    gate can only say why it matters if it is handed what was reported."""
+    uid = store.get_or_create_user(20, "Shaan")
+    store.add_watchlist(uid, "NVDA")
+    monkeypatch.setattr(gather.market, "get_quote", lambda s: _quote(s, -6.1))
+    monkeypatch.setattr(gather.filings, "get_recent_filings", _no_filings)
+    monkeypatch.setattr(gather.market, "get_earnings_info", _no_earnings)
+    asked = {}
+
+    def _news(query, symbol="", days=3):
+        asked.update(symbol=symbol, days=days)
+        return {
+            "ok": True,
+            "data": {
+                "articles": [
+                    {"title": f"Headline {i}", "source": "Reuters", "published": "t",
+                     "url": "u", "summary": "s"}
+                    for i in range(5)
+                ]
+            },
+        }
+
+    monkeypatch.setattr(gather.news, "search_financial_news", _news)
+
+    detail = gather.gather(uid, TODAY)[0]["detail"]
+
+    assert asked == {"symbol": "NVDA", "days": 1}
+    assert [h["title"] for h in detail["headlines"]] == ["Headline 0", "Headline 1", "Headline 2"]
+
+
+def test_quiet_names_never_fetch_news(monkeypatch):
+    """An empty morning must still cost nothing, not a news search per name."""
+    uid = store.get_or_create_user(21, "Shaan")
+    store.add_watchlist(uid, "NVDA")
+    monkeypatch.setattr(gather.market, "get_quote", lambda s: _quote(s, 0.3))
+    monkeypatch.setattr(gather.filings, "get_recent_filings", _no_filings)
+    monkeypatch.setattr(gather.market, "get_earnings_info", _no_earnings)
+
+    def _news(*args, **kwargs):
+        raise AssertionError("no move, no news search")
+
+    monkeypatch.setattr(gather.news, "search_financial_news", _news)
+
+    assert gather.gather(uid, TODAY) == []
+
+
+def test_a_news_outage_does_not_cost_the_move_signal(monkeypatch):
+    uid = store.get_or_create_user(22, "Shaan")
+    store.add_watchlist(uid, "NVDA")
+    monkeypatch.setattr(gather.market, "get_quote", lambda s: _quote(s, 5.0))
+    monkeypatch.setattr(gather.filings, "get_recent_filings", _no_filings)
+    monkeypatch.setattr(gather.market, "get_earnings_info", _no_earnings)
+
+    signals = gather.gather(uid, TODAY)
+
+    assert signals[0]["kind"] == "move"
+    assert signals[0]["detail"]["headlines"] == []
+
+
 def test_only_todays_material_filings_count(monkeypatch):
     uid = store.get_or_create_user(3, "Shaan")
     store.add_watchlist(uid, "TSLA")
@@ -225,27 +285,29 @@ def test_on_demand_reports_when_there_is_nothing(monkeypatch):
 
     result = briefing.build_now(uid, "UTC")
 
-    assert result["has_news"] is False
-    assert result["brief"] is None
-    assert result["signals_considered"] == 0
+    assert result == {"has_news": False, "signals": []}
 
 
-def test_on_demand_returns_the_brief_when_there_is_news(monkeypatch):
+def test_on_demand_hands_the_signals_to_the_chat_model(monkeypatch):
+    """No gate and no model call of its own: it used to spend a request writing
+    prose that the chat model then rewrote."""
     uid = store.get_or_create_user(21, "Shaan")
     monkeypatch.setattr(briefing, "local_today", lambda tz: TODAY)
     monkeypatch.setattr(
-        briefing.gather, "gather", lambda u, d: [{"key": "k", "summary": "NVDA +7%"}]
+        briefing.gather,
+        "gather",
+        lambda u, d: [{"key": "k", "kind": "move", "summary": "NVDA up 7%", "detail": {"price": 1}}],
     )
-    monkeypatch.setattr(briefing.gather, "market_context", lambda: None)
-    monkeypatch.setattr(
-        briefing.salience, "_decide_sync",
-        lambda p, i=None: {"send": True, "brief": "*NVDA* up 7%", "used_keys": ["k"]},
-    )
+
+    def _no_model(*args, **kwargs):
+        raise AssertionError("the on-demand path must not call a model")
+
+    monkeypatch.setattr(salience, "_decide_sync", _no_model)
 
     result = briefing.build_now(uid, "UTC")
 
     assert result["has_news"] is True
-    assert result["brief"] == "*NVDA* up 7%"
+    assert result["signals"] == [{"kind": "move", "summary": "NVDA up 7%", "detail": {"price": 1}}]
 
 
 def test_on_demand_does_not_consume_the_dedupe_ledger(monkeypatch):
@@ -269,46 +331,127 @@ def test_on_demand_does_not_consume_the_dedupe_ledger(monkeypatch):
     assert store.filter_unsent(uid, [f"move:NVDA:{TODAY}"]) == [f"move:NVDA:{TODAY}"]
 
 
-def test_silent_gate_still_reports_how_many_were_weighed(monkeypatch):
-    uid = store.get_or_create_user(23, "Shaan")
-    monkeypatch.setattr(briefing, "local_today", lambda tz: TODAY)
-    monkeypatch.setattr(
-        briefing.gather, "gather", lambda u, d: [{"key": "a"}, {"key": "b"}]
-    )
-    monkeypatch.setattr(briefing.gather, "market_context", lambda: None)
-    monkeypatch.setattr(
-        briefing.salience, "_decide_sync", lambda p, i=None: {"send": False, "brief": ""}
-    )
-
-    result = briefing.build_now(uid, "UTC")
-
-    assert result["has_news"] is False
-    assert result["signals_considered"] == 2
-
-
-def test_push_and_pull_use_different_instructions(monkeypatch):
-    """An unprompted ping must clear a higher bar than an explicit request."""
-    seen = {}
-
-    def _capture(prompt, instruction=salience.PUSH_INSTRUCTION):
-        seen.setdefault("instructions", []).append(instruction)
-        return {"send": False, "brief": ""}
-
-    monkeypatch.setattr(salience, "_decide_sync", _capture)
-    sig = [{"key": "k", "summary": "s"}]
-
-    salience.decide_sync({}, [], sig, None)
-
-    assert seen["instructions"] == [salience.PULL_INSTRUCTION]
+def test_the_scheduled_gate_keeps_its_strict_bar():
     assert "did not ask for this" in salience.PUSH_INSTRUCTION
-    assert "has just ASKED" in salience.PULL_INSTRUCTION
+    assert "why it matters" in salience.PUSH_INSTRUCTION
+    assert "Never invent or estimate a figure" in salience.PUSH_INSTRUCTION
 
 
-def test_pull_instruction_forbids_silence_to_avoid_bothering():
-    assert "never to avoid bothering someone who asked" in salience.PULL_INSTRUCTION
+# --- audit fixes, 2026-09-16 -----------------------------------------------------
 
 
-def test_both_instructions_share_the_formatting_body():
-    for text in (salience.PUSH_INSTRUCTION, salience.PULL_INSTRUCTION):
-        assert "why it matters" in text
-        assert "Never invent or estimate a figure" in text
+def _filings(*rows):
+    return lambda symbol, limit=5: {
+        "ok": True,
+        "data": {"filings": [{"form": f, "filed_on": d, "url": "u"} for f, d in rows]},
+    }
+
+
+def test_filings_are_read_over_a_window_and_past_routine_forms(monkeypatch):
+    """Only the newest three filings were read, before the form filter, and only
+    ones dated exactly the user's local today: an 8-K behind two Form 4s, or filed
+    Friday evening, never surfaced."""
+    uid = store.get_or_create_user(30, "Shaan")
+    store.add_watchlist(uid, "NVDA")
+    monkeypatch.setattr(gather.market, "get_quote", lambda s: _quote(s, 0.1))
+    monkeypatch.setattr(gather.market, "get_earnings_info", _no_earnings)
+    asked = {}
+
+    def _recent(symbol, limit=5):
+        asked["limit"] = limit
+        return _filings(
+            ("4", TODAY), ("4", TODAY), ("4", TODAY),
+            ("8-K", "2026-08-06"),
+            ("SCHEDULE 13D", "2026-08-05"),
+            ("10-Q", "2026-07-01"),
+        )(symbol, limit)
+
+    monkeypatch.setattr(gather.filings, "get_recent_filings", _recent)
+
+    kinds = sorted(s["summary"] for s in gather.gather(uid, TODAY))
+
+    assert asked["limit"] >= 20
+    assert kinds == ["NVDA filed a 8-K", "NVDA filed a SCHEDULE 13D"]
+
+
+def test_a_move_is_keyed_by_its_trading_session(monkeypatch):
+    """Keyed by calendar day, Friday's move was offered again on Saturday,
+    Sunday and Monday."""
+    uid = store.get_or_create_user(31, "Shaan")
+    store.add_watchlist(uid, "NVDA")
+
+    def _friday(symbol):
+        quote = _quote(symbol, -6.1)
+        quote["data"]["session_date"] = "2026-08-07"
+        return quote
+
+    monkeypatch.setattr(gather.market, "get_quote", _friday)
+    monkeypatch.setattr(gather.filings, "get_recent_filings", _no_filings)
+    monkeypatch.setattr(gather.market, "get_earnings_info", _no_earnings)
+
+    saturday = gather.gather(uid, "2026-08-08")
+    sunday = gather.gather(uid, "2026-08-09")
+
+    assert saturday[0]["key"] == sunday[0]["key"] == "move:NVDA:2026-08-07"
+
+
+def test_an_unconfirmed_earnings_window_is_not_a_signal(monkeypatch):
+    uid = store.get_or_create_user(32, "Shaan")
+    store.add_watchlist(uid, "NVDA")
+    monkeypatch.setattr(gather.market, "get_quote", lambda s: _quote(s, 0.1))
+    monkeypatch.setattr(gather.filings, "get_recent_filings", _no_filings)
+    monkeypatch.setattr(
+        gather.market,
+        "get_earnings_info",
+        lambda s: {"ok": True, "data": {"next_earnings_date": None, "estimated_window": [TODAY, "2026-08-12"]}},
+    )
+
+    assert gather.gather(uid, TODAY) == []
+
+
+class _JobQueue:
+    def __init__(self, jobs=()):
+        self._jobs = list(jobs)
+        self.daily = []
+
+    def jobs(self):
+        return self._jobs
+
+    def run_daily(self, callback, time, name, data, job_kwargs=None):
+        self.daily.append({"name": name, "job_kwargs": job_kwargs})
+
+
+class _Job:
+    def __init__(self, name):
+        self.name, self.removed = name, False
+
+    def schedule_removal(self):
+        self.removed = True
+
+
+def test_a_failed_roster_read_keeps_the_briefings_scheduled(monkeypatch):
+    from atlas.proactive import scheduler
+
+    existing = _Job("briefing:1")
+    queue = _JobQueue([existing])
+
+    def _down():
+        raise RuntimeError("the database is restarting")
+
+    monkeypatch.setattr(scheduler.store, "users_with_briefings", _down)
+
+    assert scheduler.sync_jobs(queue) == 0
+    assert existing.removed is False
+
+
+def test_a_briefing_survives_a_short_stall(monkeypatch):
+    """APScheduler's default misfire grace is one second."""
+    from atlas.proactive import scheduler
+
+    uid = store.get_or_create_user(33, "Shaan")
+    store.set_profile(uid, briefing_time="08:30", timezone="Asia/Kolkata")
+    queue = _JobQueue()
+
+    scheduler.sync_jobs(queue)
+
+    assert queue.daily[0]["job_kwargs"]["misfire_grace_time"] >= 600

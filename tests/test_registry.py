@@ -41,3 +41,44 @@ def test_every_tool_has_a_docstring():
 
     for tool in build_tools(uid):
         assert tool.__doc__, f"{tool.__name__} has no docstring"
+
+
+
+def test_a_replayed_turn_does_not_fetch_again(monkeypatch):
+    """Failover to the next model reran every tool call from the start."""
+    import inspect
+
+    import atlas.tools.market as market
+
+    fetched = []
+
+    def _quote(symbol):
+        fetched.append(symbol)
+        return {"symbol": symbol, "price": 1.0, "source": "T"}
+
+    monkeypatch.setattr(market, "_fetch_quote", _quote)
+    uid = store.get_or_create_user(3, "Shaan")
+    tool = {t.__name__: t for t in build_tools(uid)}["get_quote"]
+
+    assert tool(symbol="NVDA")["ok"] is True
+    assert tool(symbol="NVDA")["ok"] is True
+    assert fetched == ["NVDA"]
+    # The declaration the models see is unchanged.
+    assert list(inspect.signature(tool).parameters) == ["symbol"]
+    assert "Ticker symbol" in tool.__doc__
+
+    # A new turn gets a fresh memo.
+    {t.__name__: t for t in build_tools(uid)}["get_quote"](symbol="NVDA")
+    assert fetched == ["NVDA", "NVDA"]
+
+
+def test_failures_are_not_memoized(monkeypatch):
+    import atlas.tools.market as market
+
+    answers = iter([None, {"symbol": "NVDA", "price": 2.0, "source": "T"}])
+    monkeypatch.setattr(market, "_fetch_quote", lambda symbol: next(answers))
+    uid = store.get_or_create_user(4, "Shaan")
+    tool = {t.__name__: t for t in build_tools(uid)}["get_quote"]
+
+    assert tool(symbol="NVDA")["ok"] is False
+    assert tool(symbol="NVDA")["ok"] is True

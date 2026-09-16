@@ -1,7 +1,12 @@
-from datetime import datetime, timezone
+import re
+from datetime import datetime, timedelta, timezone
+
+from sqlalchemy import func
+from sqlalchemy.exc import IntegrityError
 
 from atlas.db.models import (
     Alert,
+    Document,
     MemoryFact,
     Message,
     SentSignal,
@@ -11,16 +16,29 @@ from atlas.db.models import (
 from atlas.db.session import session_scope
 
 PROFILE_FIELDS = {"name", "role", "timezone", "briefing_time", "onboarding_state"}
+# Column widths, enforced here: Postgres rejects an over-long value outright and
+# the rollback takes every other field in the same update down with it.
+PROFILE_LIMITS = {"name": 120, "role": 80, "timezone": 64}
+
+
+def _find_user(session, telegram_id: int):
+    return session.query(User).filter_by(telegram_id=telegram_id).one_or_none()
 
 
 def get_or_create_user(telegram_id: int, name: str | None = None) -> int:
-    with session_scope() as s:
-        user = s.query(User).filter_by(telegram_id=telegram_id).one_or_none()
-        if user is None:
-            user = User(telegram_id=telegram_id, name=name)
-            s.add(user)
-            s.flush()
-        return user.id
+    try:
+        with session_scope() as s:
+            user = _find_user(s, telegram_id)
+            if user is None:
+                user = User(telegram_id=telegram_id, name=(name or None) and name[:120])
+                s.add(user)
+                s.flush()
+            return user.id
+    except IntegrityError:
+        # A brand-new user's first updates run concurrently; both miss the SELECT
+        # and the second INSERT loses. The winner's row is there now.
+        with session_scope() as s:
+            return _find_user(s, telegram_id).id
 
 
 def set_profile(user_id: int, **fields) -> None:
@@ -31,6 +49,8 @@ def set_profile(user_id: int, **fields) -> None:
         user = s.get(User, user_id)
         for key, value in fields.items():
             if value is not None:
+                if key in PROFILE_LIMITS and isinstance(value, str):
+                    value = value.strip()[: PROFILE_LIMITS[key]]
                 setattr(user, key, value)
 
 
@@ -56,11 +76,13 @@ def add_fact(user_id: int, fact: str, category: str = "general") -> None:
     if not normalized:
         return
     with session_scope() as s:
+        # Equality on lower(), not ILIKE: the fact is user text, and as a pattern
+        # "Owns 5% of X" matched "Owns 50% of X" and was dropped as a duplicate.
         existing = (
-            s.query(MemoryFact)
+            s.query(MemoryFact.id)
             .filter(MemoryFact.user_id == user_id)
-            .filter(MemoryFact.fact.ilike(normalized))
-            .one_or_none()
+            .filter(func.lower(MemoryFact.fact) == normalized.lower())
+            .first()
         )
         if existing is None:
             s.add(MemoryFact(user_id=user_id, fact=normalized, category=category))
@@ -78,13 +100,24 @@ def all_facts(user_id: int) -> list[dict]:
 
 
 def forget(user_id: int, needle: str) -> int:
+    """Delete facts that mention `needle` as a whole word, case-insensitively.
+
+    Matched in Python rather than with ILIKE: the needle comes from the model, and
+    as a pattern an empty string or "_" deleted every fact the user had, while
+    "EV" deleted anything containing the letters e-v. A trailing plural or
+    possessive still counts, so "briefing" finds "Prefers morning briefings" —
+    which is how people and models actually phrase it.
+    """
+    words = needle.strip()
+    if not re.search(r"\w", words):
+        return 0
+    pattern = re.compile(rf"(?<!\w){re.escape(words)}(?:'s|es|s)?(?!\w)", re.IGNORECASE)
     with session_scope() as s:
-        rows = (
-            s.query(MemoryFact)
-            .filter(MemoryFact.user_id == user_id)
-            .filter(MemoryFact.fact.ilike(f"%{needle}%"))
-            .all()
-        )
+        rows = [
+            row
+            for row in s.query(MemoryFact).filter(MemoryFact.user_id == user_id).all()
+            if pattern.search(row.fact)
+        ]
         for row in rows:
             s.delete(row)
         return len(rows)
@@ -169,14 +202,33 @@ def mark_sent(user_id: int, keys: list[str]) -> None:
             s.add(SentSignal(user_id=user_id, signal_key=key))
 
 
+def count_alerts(user_id: int) -> int:
+    with session_scope() as s:
+        return s.query(Alert).filter_by(user_id=user_id, active=True).count()
+
+
 def create_alert(
     user_id: int, description: str, symbol: str, kind: str, threshold: float
 ) -> int:
+    """Arm an alert, or return the id of the identical one already armed.
+
+    Idempotent because model failover replays a turn's whole tool loop, which
+    used to arm the same alert once for every model that tried.
+    """
+    ticker = symbol.strip().upper()
     with session_scope() as s:
+        existing = (
+            s.query(Alert.id)
+            .filter_by(user_id=user_id, symbol=ticker, kind=kind, active=True)
+            .filter(Alert.threshold == float(threshold))
+            .first()
+        )
+        if existing is not None:
+            return existing.id
         alert = Alert(
             user_id=user_id,
             description=description.strip(),
-            symbol=symbol.strip().upper(),
+            symbol=ticker,
             kind=kind,
             threshold=threshold,
         )
@@ -243,6 +295,13 @@ def mark_alert_fired(alert_id: int, when: datetime | None = None) -> None:
             alert.last_fired_at = stamp
 
 
+def disarm_alert(alert_id: int) -> None:
+    with session_scope() as s:
+        alert = s.get(Alert, alert_id)
+        if alert is not None:
+            alert.active = False
+
+
 def cancel_alerts(user_id: int, symbol: str) -> int:
     with session_scope() as s:
         rows = (
@@ -253,6 +312,30 @@ def cancel_alerts(user_id: int, symbol: str) -> int:
         for row in rows:
             row.active = False
         return len(rows)
+
+
+def add_document(user_id: int, uri: str, name: str, mime: str) -> None:
+    with session_scope() as s:
+        s.add(
+            Document(
+                user_id=user_id, file_uri=uri[:512], display_name=name[:255], mime_type=mime[:120]
+            )
+        )
+
+
+def recent_document(user_id: int, within: timedelta) -> dict | None:
+    """The user's latest upload, if it arrived within `within` of now."""
+    cutoff = datetime.now(timezone.utc).replace(tzinfo=None) - within
+    with session_scope() as s:
+        row = (
+            s.query(Document)
+            .filter(Document.user_id == user_id, Document.created_at >= cutoff)
+            .order_by(Document.id.desc())
+            .first()
+        )
+        if row is None:
+            return None
+        return {"uri": row.file_uri, "name": row.display_name, "mime": row.mime_type}
 
 
 def append_message(user_id: int, role: str, content: str) -> None:

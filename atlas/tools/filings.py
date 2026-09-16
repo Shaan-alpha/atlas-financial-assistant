@@ -12,11 +12,14 @@ HEADERS = {"User-Agent": "Atlas Financial Assistant (contact: shaansatsangi@gmai
 
 
 @lru_cache(maxsize=1)
+def _http() -> httpx.Client:
+    return httpx.Client(headers=HEADERS, timeout=30)
+
+
+@lru_cache(maxsize=1)
 def _fetch_cik_map() -> dict[str, str]:
     """Map ticker -> zero-padded CIK. Cached; the file is large and changes rarely."""
-    resp = httpx.get(
-        "https://www.sec.gov/files/company_tickers.json", headers=HEADERS, timeout=30
-    )
+    resp = _http().get("https://www.sec.gov/files/company_tickers.json")
     resp.raise_for_status()
     return {
         row["ticker"].upper(): str(row["cik_str"]).zfill(10)
@@ -25,9 +28,7 @@ def _fetch_cik_map() -> dict[str, str]:
 
 
 def _fetch_submissions(cik: str) -> dict | None:
-    resp = httpx.get(
-        f"https://data.sec.gov/submissions/CIK{cik}.json", headers=HEADERS, timeout=30
-    )
+    resp = _http().get(f"https://data.sec.gov/submissions/CIK{cik}.json")
     if resp.status_code != 200:
         return None
     return resp.json()
@@ -47,7 +48,10 @@ def get_recent_filings(symbol: str, form_type: str = "", limit: int = 5) -> dict
         limit: Maximum filings to return.
     """
     try:
-        cik = _fetch_cik_map().get(symbol.upper())
+        tickers = _fetch_cik_map()
+        # SEC writes share classes with a hyphen (BRK-B); people write BRK.B.
+        key = symbol.strip().upper()
+        cik = tickers.get(key) or tickers.get(key.replace(".", "-"))
     except Exception:
         return err("edgar_unavailable", "SEC EDGAR is not responding right now.")
 

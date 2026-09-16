@@ -48,3 +48,23 @@ def test_prompt_forbids_command_surface():
 
     assert "slash command" in prompt.lower()
     assert "button" in prompt.lower()
+
+
+
+def test_only_the_newest_facts_ride_along():
+    from atlas.engine import prompt
+
+    facts = [{"category": "general", "fact": f"fact {i}"} for i in range(100)]
+
+    text = prompt.build_system_prompt({}, facts)
+
+    lines = text.splitlines()
+    assert "- [general] fact 0" in lines
+    assert f"- [general] fact {prompt.MAX_FACTS_IN_PROMPT - 1}" in lines
+    assert f"- [general] fact {prompt.MAX_FACTS_IN_PROMPT}" not in lines
+
+
+def test_the_prompt_forbids_assuming_dollars():
+    from atlas.engine import prompt
+
+    assert "Never assume dollars" in prompt.BASE

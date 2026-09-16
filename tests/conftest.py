@@ -43,3 +43,41 @@ def _no_live_extraction(monkeypatch):
         return []
 
     monkeypatch.setattr(extract, "_extract", _none)
+
+
+@pytest.fixture(autouse=True)
+def _no_live_news(monkeypatch):
+    """News feeds are plain HTTP, reachable from anything that gathers a briefing.
+    Offline by default; tests/test_news.py replaces the seam with canned feeds."""
+    import atlas.tools.news as news
+
+    def _offline(url, params):
+        raise ConnectionError("news feeds are offline in tests")
+
+    monkeypatch.setattr(news, "_http_get", _offline)
+
+
+@pytest.fixture(autouse=True)
+def _no_live_fallback(monkeypatch):
+    """The Groq fallback runs whenever a test exhausts the Gemini chain. Keep it
+    offline, and failing, so those tests see the Gemini-only behaviour they assert
+    unless they opt in by replacing these seams themselves."""
+    import atlas.engine.fallback as fallback
+
+    async def _offline(model, messages, tools):
+        raise ConnectionError("groq is offline in tests")
+
+    def _offline_json(model, system, prompt):
+        raise ConnectionError("groq is offline in tests")
+
+    monkeypatch.setattr(fallback, "_complete", _offline)
+    monkeypatch.setattr(fallback, "_complete_json", _offline_json)
+
+
+@pytest.fixture(autouse=True)
+def _symbols_are_quotable(monkeypatch):
+    """create_alert checks a symbol can be quoted before arming it. Offline, treat
+    every symbol as quotable; tests of the refusal replace this themselves."""
+    import atlas.tools.memory_tools as memory_tools
+
+    monkeypatch.setattr(memory_tools, "_symbol_is_quotable", lambda symbol: True)

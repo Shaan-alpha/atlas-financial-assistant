@@ -184,3 +184,93 @@ async def test_cancelled_alerts_never_fire(monkeypatch):
 
     bot = _Bot()
     assert await alerts.check_all(bot, now=NOW) == 0
+
+
+# --- audit fixes, 2026-09-16 -----------------------------------------------------
+
+
+def test_alerts_are_capped_per_user(monkeypatch):
+    import atlas.tools.memory_tools as memory_tools
+
+    monkeypatch.setattr(memory_tools, "MAX_ALERTS", 2)
+    uid = store.get_or_create_user(60, "Shaan")
+    t = tools(uid)
+    t["create_alert"]("a", "TSLA", "move_pct", 5.0)
+    t["create_alert"]("b", "NVDA", "move_pct", 5.0)
+
+    result = t["create_alert"]("c", "AMD", "move_pct", 5.0)
+
+    assert result["ok"] is False
+    assert result["error"] == "too_many_alerts"
+
+
+def test_an_unquotable_symbol_is_not_armed(monkeypatch):
+    """Otherwise the user is told a watch is set on something that can never
+    fire, and the watcher spends a provider call on it every 15 minutes."""
+    import atlas.tools.memory_tools as memory_tools
+
+    monkeypatch.setattr(memory_tools, "_symbol_is_quotable", lambda symbol: False)
+    uid = store.get_or_create_user(61, "Shaan")
+
+    result = tools(uid)["create_alert"]("watch it", "XYZQQ", "move_pct", 5.0)
+
+    assert result["ok"] is False
+    assert result["error"] == "no_such_symbol"
+    assert store.user_alerts(uid) == []
+
+
+def _quote_fn(price, change, session="2026-08-07", calls=None):
+    def _get(symbol):
+        if calls is not None:
+            calls.append(symbol)
+        return {
+            "ok": True,
+            "data": {"price": price, "change_pct": change, "previous_close": 100.0,
+                     "session_date": session},
+            "source": "Finnhub",
+        }
+
+    return _get
+
+
+async def test_a_price_level_alert_fires_once_and_switches_off(monkeypatch):
+    """It re-fired every six hours for as long as the price stayed past the level."""
+    uid = store.get_or_create_user(62, "Shaan")
+    tools(uid)["create_alert"]("tell me if NVDA drops below 200", "NVDA", "price_below", 200.0)
+    monkeypatch.setattr(alerts.market, "get_quote", _quote_fn(190.0, -3.0))
+    bot = _Bot()
+
+    assert await alerts.check_all(bot, now=NOW) == 1
+    assert "switched this watch off" in bot.sent[0]["text"]
+    assert await alerts.check_all(bot, now=NOW + dt.timedelta(hours=7)) == 0
+    assert store.user_alerts(uid) == []
+
+
+async def test_a_move_alert_fires_once_per_trading_session(monkeypatch):
+    """A daily change is frozen from the close to the next open, so Friday's move
+    was re-announced overnight and all weekend."""
+    uid = store.get_or_create_user(63, "Shaan")
+    tools(uid)["create_alert"]("ping me on a 5% TSLA move", "TSLA", "move_pct", 5.0)
+    bot = _Bot()
+
+    monkeypatch.setattr(alerts.market, "get_quote", _quote_fn(300.0, -7.1, "2026-08-07"))
+    assert await alerts.check_all(bot, now=NOW) == 1
+    # Past the cooldown, still the same session: silent.
+    assert await alerts.check_all(bot, now=NOW + dt.timedelta(hours=30)) == 0
+
+    # A new session with its own big move fires again.
+    monkeypatch.setattr(alerts.market, "get_quote", _quote_fn(280.0, -6.5, "2026-08-10"))
+    assert await alerts.check_all(bot, now=NOW + dt.timedelta(hours=80)) == 1
+    assert len(store.user_alerts(uid)) == 1
+
+
+async def test_a_sweep_fetches_each_symbol_once(monkeypatch):
+    calls = []
+    for telegram_id in (64, 65, 66):
+        uid = store.get_or_create_user(telegram_id, "Shaan")
+        tools(uid)["create_alert"]("watch TSLA", "TSLA", "move_pct", 50.0)
+    monkeypatch.setattr(alerts.market, "get_quote", _quote_fn(300.0, 1.0, calls=calls))
+
+    await alerts.check_all(_Bot(), now=NOW)
+
+    assert calls == ["TSLA"]

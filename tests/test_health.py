@@ -70,3 +70,25 @@ def test_ping_swallows_a_dead_target():
 )
 def test_database_url_is_normalized_for_sqlalchemy(raw, expected):
     assert _normalize_database_url(raw) == expected
+
+
+
+def test_diag_reuses_its_probe(monkeypatch, env):
+    """Each hit used to make eight live provider calls."""
+    from atlas.integrations import marketdata
+
+    calls = []
+    monkeypatch.setattr(health, "_diag_cache", {})
+    monkeypatch.setattr(
+        marketdata, "probe", lambda symbol, include_limited=False: calls.append(include_limited) or {}
+    )
+    server = start_health_server(0, "127.0.0.1")
+    try:
+        port = server.server_address[1]
+        for _ in range(3):
+            assert httpx.get(f"http://127.0.0.1:{port}/diag", timeout=5).status_code == 200
+        httpx.get(f"http://127.0.0.1:{port}/diag?all=1", timeout=5)
+    finally:
+        server.shutdown()
+
+    assert calls == [False, True]

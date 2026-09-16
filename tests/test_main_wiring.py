@@ -2,8 +2,8 @@
 
 main() had no coverage at all, which is how drop_pending_updates=False and
 one-at-a-time update processing survived unnoticed. Nothing here starts a bot:
-the port bind, the yfinance prewarm and run_polling are the only three things
-that reach outside the process, and all three are replaced.
+the port bind and run_polling are the only things that reach outside the
+process, and both are replaced.
 """
 
 import sys
@@ -15,7 +15,6 @@ from telegram.ext import Application
 
 import atlas.main as main
 from atlas.config import get_settings
-from atlas.integrations import marketdata
 from atlas.ingress import handlers
 from atlas.memory import store
 
@@ -25,23 +24,20 @@ pytestmark = pytest.mark.usefixtures("fresh_db")
 @pytest.fixture
 def run_main(monkeypatch):
     """Run main() up to the point it would start polling; hand back what it built."""
-    seen = {"order": [], "prewarms": 0}
+    seen = {"order": []}
     real_init_db = main.init_db
 
     def _run_polling(self, **kwargs):
         seen["app"] = self
         seen["polling"] = kwargs
 
-    def _health(port):
+    def _health(port, host="0.0.0.0"):
         seen["order"].append("health")
-        seen["port"] = port
+        seen["port"], seen["host"] = port, host
 
     def _init_db():
         seen["order"].append("init_db")
         real_init_db()
-
-    def _prewarm():
-        seen["prewarms"] += 1
 
     def _exit(code):
         # main() ends in os._exit so a dead poller cannot linger as a zombie.
@@ -54,8 +50,6 @@ def run_main(monkeypatch):
     monkeypatch.setattr(main, "start_health_server", _health)
     monkeypatch.setattr(main, "init_db", _init_db)
     monkeypatch.setattr(main, "_configure_logging", lambda level: None)
-    # Replaced, not merely joined: the real one pays a ~12s import.
-    monkeypatch.setattr(marketdata, "prewarm", _prewarm)
 
     def _run():
         main.main()
@@ -117,10 +111,6 @@ def test_no_public_url_means_no_self_ping(run_main):
     assert "_keepalive" not in names
 
 
-def test_startup_kicks_off_the_yfinance_prewarm(run_main):
-    assert run_main()["prewarms"] == 1
-
-
 def test_the_watchdog_spots_a_running_app_with_a_dead_poller():
     """The zombie, exactly: Application up, job queue ticking, polling task
     finished. Both flags drop together on a real shutdown, so only this shape
@@ -150,26 +140,63 @@ def test_the_watchdog_survives_a_renamed_internal():
     assert main._polling_is_dead(app) is False
 
 
-def test_a_dead_poller_takes_the_process_down(run_main):
-    """The failure this exists for: a redeploy overlap raises getUpdates
-    Conflict, PTB tears the Application down, and the health thread keeps
-    answering 200 — so the host never restarts a bot that is serving nobody."""
+def test_a_requested_stop_exits_cleanly(run_main, caplog):
+    """run_polling only returns once a stop signal arrives: PTB catches SIGTERM
+    itself and shuts down in order. Every `systemctl restart` used to log an ERROR
+    and exit 1, so a deploy looked exactly like a crash in the journal."""
+    with caplog.at_level("INFO", logger="atlas.main"):
+        seen = run_main()
+
+    assert seen["exit_code"] == 0
+    assert "ERROR" not in [r.levelname for r in caplog.records if r.name == "atlas.main"]
+
+
+def test_a_crashed_poller_takes_the_process_down(run_main, monkeypatch):
+    """A poller that raises (a revoked token, a network that never comes back
+    during bootstrap) must exit non-zero so the host restarts it and says why."""
+
+    def _crash(self, **kwargs):
+        raise RuntimeError("bootstrap failed")
+
+    monkeypatch.setattr(Application, "run_polling", _crash)
+
     seen = run_main()
 
     assert seen["exit_code"] == 1
     assert seen.get("marked") is True
 
 
-def test_a_broken_prewarm_does_not_stop_the_bot(run_main, monkeypatch):
-    """Prewarming is an optimisation. If yfinance cannot import, the other quote
-    providers still work and the bot must come up anyway."""
+async def test_polling_network_blips_are_one_line_warnings(caplog):
+    """Telegram answers getUpdates with Bad Gateway some nights; PTB retries on
+    its own. A full traceback at ERROR for each one buries real faults."""
+    from telegram.error import NetworkError
 
-    def _boom():
-        raise ImportError("no yfinance here")
+    context = SimpleNamespace(error=NetworkError("Bad Gateway"))
 
-    monkeypatch.setattr(marketdata, "prewarm", _boom)
+    with caplog.at_level("DEBUG", logger="atlas.main"):
+        await main._on_error(None, context)
 
-    assert run_main()["polling"]["drop_pending_updates"] is True
+    records = [r for r in caplog.records if r.name == "atlas.main"]
+    assert [r.levelname for r in records] == ["WARNING"]
+    assert records[0].exc_info is None
+
+
+def test_sdk_chatter_is_filtered_but_real_warnings_are_not(caplog):
+    """google-genai logs an INFO and a WARNING on every single model call."""
+    import logging
+
+    main._quiet_sdk_chatter()
+    sdk = logging.getLogger("google_genai.models")
+
+    with caplog.at_level("INFO", logger="google_genai.models"):
+        sdk.info("AFC is enabled with max remote calls: 8.")
+        sdk.warning(
+            "Direct use of automatic function calling (AFC) in AsyncModels.generate_content "
+            "is not recommended."
+        )
+        sdk.warning("Model gemini-x is deprecated")
+
+    assert [r.getMessage() for r in caplog.records] == ["Model gemini-x is deprecated"]
 
 
 def test_startup_does_not_import_yfinance(run_main):
@@ -180,31 +207,10 @@ def test_startup_does_not_import_yfinance(run_main):
     assert "yfinance" not in sys.modules
 
 
-def test_prewarm_imports_on_a_background_daemon_thread(monkeypatch):
-    """The point is to move the 12s off the boot path — not onto it."""
-    seen = {}
+def test_health_answers_on_loopback_unless_a_host_must_reach_it(run_main, monkeypatch):
+    """/diag spends provider quota; on the VM nothing outside needs the port."""
+    assert run_main()["host"] == "127.0.0.1"
 
-    def _warm():
-        seen["thread"] = threading.current_thread()
-
-    monkeypatch.setattr(marketdata, "_warm", _warm)
-
-    thread = marketdata.prewarm()
-    thread.join(timeout=10)
-
-    assert seen["thread"] is thread
-    assert thread is not threading.main_thread()
-    # A non-daemon prewarm would hold the process open on shutdown.
-    assert thread.daemon is True
-
-
-def test_a_prewarm_that_cannot_import_is_survivable(monkeypatch):
-    """_warm swallows its own failure: an unhandled exception in a thread only
-    prints a traceback, which reads like a crashed startup."""
-
-    def _no_module(name):
-        raise ImportError("yfinance is not installed")
-
-    monkeypatch.setattr(marketdata.importlib, "import_module", _no_module)
-
-    marketdata._warm()  # must not raise
+    monkeypatch.setenv("PUBLIC_URL", "https://atlas.example")
+    get_settings.cache_clear()
+    assert run_main()["host"] == "0.0.0.0"

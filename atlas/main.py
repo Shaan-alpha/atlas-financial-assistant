@@ -4,14 +4,14 @@ import os
 import threading
 import time
 
-from telegram.error import Conflict
+from telegram import Update
+from telegram.error import Conflict, NetworkError
 from telegram.ext import ApplicationBuilder, CommandHandler, MessageHandler, filters
 
 from atlas.config import get_settings
 from atlas.db.session import init_db
 from atlas.health import mark_polling_stopped, ping, start_health_server
 from atlas.ingress import handlers
-from atlas.integrations import marketdata
 from atlas.proactive import alerts, scheduler
 
 log = logging.getLogger(__name__)
@@ -40,6 +40,28 @@ def _configure_logging(level: str) -> None:
     logging.getLogger("httpx").setLevel(logging.WARNING)
     logging.getLogger("httpcore").setLevel(logging.WARNING)
     logging.getLogger("telegram.ext.Updater").setLevel(logging.WARNING)
+    _quiet_sdk_chatter()
+
+
+class _DropSdkChatter(logging.Filter):
+    """google-genai logs an INFO and a WARNING on every model call. The warning
+    recommends a chat API that would change nothing for a stateless turn, and the
+    pair made up most of the journal, burying the lines that matter."""
+
+    NOISE = (
+        "AFC is enabled with max remote calls",
+        "Direct use of automatic function calling",
+    )
+
+    def filter(self, record: logging.LogRecord) -> bool:
+        message = record.getMessage()
+        return not any(noise in message for noise in self.NOISE)
+
+
+def _quiet_sdk_chatter() -> None:
+    sdk = logging.getLogger("google_genai.models")
+    if not any(isinstance(f, _DropSdkChatter) for f in sdk.filters):
+        sdk.addFilter(_DropSdkChatter())
 
 
 async def _keepalive(context) -> None:
@@ -56,6 +78,11 @@ async def _on_error(update, context) -> None:
     error = context.error
     if isinstance(error, Conflict):
         log.warning("another instance is polling; this resolves on its own")
+        return
+    if isinstance(error, NetworkError) and update is None:
+        # getUpdates hit a network blip (Telegram answers Bad Gateway some
+        # nights). PTB retries on its own and no user is waiting on it.
+        log.warning("telegram polling network error, retrying: %s", error)
         return
 
     log.exception("unhandled error while processing an update", exc_info=error)
@@ -103,7 +130,7 @@ def _watch_polling(app) -> None:
         _die()
 
 
-def _die() -> None:
+def _die(code: int = 1) -> None:
     """Report unhealthy, flush, and go — so the platform restarts a fresh process."""
     mark_polling_stopped()
     # Flush by hand: _exit skips atexit, and losing these lines would leave the
@@ -112,7 +139,7 @@ def _die() -> None:
         handler.flush()
     # _exit, not sys.exit: a hung shutdown must not keep the zombie alive, and
     # that hang is the exact failure being fixed.
-    os._exit(1)
+    os._exit(code)
 
 
 def main() -> None:
@@ -122,17 +149,14 @@ def main() -> None:
     # Bind the port BEFORE touching the database. Hosts kill a web service that
     # never opens a port, so doing this second turns any database problem into
     # two misleading errors instead of one useful one.
-    start_health_server(settings.port)
+    # A host that probes health over the network (a PaaS, with PUBLIC_URL set)
+    # needs every interface. On the VM nothing outside needs it, and /diag spends
+    # provider quota, so it answers on loopback only.
+    start_health_server(settings.port, "0.0.0.0" if settings.public_url else "127.0.0.1")
 
-    # Kick off the ~12s yfinance import now so it lands on the boot window
-    # rather than on the first user who asks for price history. Returns
-    # immediately; the work happens on a daemon thread.
-    try:
-        marketdata.prewarm()
-    except Exception:
-        # Purely an optimisation — a host too constrained to spawn the thread
-        # must still get a running bot, just a slower first lookup.
-        log.warning("could not start the yfinance prewarm", exc_info=True)
+    # No yfinance prewarm any more: price history and earnings come over plain
+    # HTTP, so pandas and numpy stay out of a 1 GiB machine's memory unless a
+    # rare fallback actually needs them.
 
     init_db()
 
@@ -143,12 +167,17 @@ def main() -> None:
         .build()
     )
 
+    # New messages in private chats only. Edits used to reach handlers that read
+    # update.message, which is None for an edit. And a reply in a group is built
+    # from the sender's private history and facts, which the group would read.
+    direct = filters.UpdateType.MESSAGE & filters.ChatType.PRIVATE
+
     # /start only: Telegram's UI sends it on first open. No other command exists.
-    app.add_handler(CommandHandler("start", handlers.start))
-    app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handlers.on_text))
-    app.add_handler(MessageHandler(filters.VOICE | filters.AUDIO, handlers.on_voice))
-    app.add_handler(MessageHandler(filters.PHOTO, handlers.on_photo))
-    app.add_handler(MessageHandler(filters.Document.ALL, handlers.on_document))
+    app.add_handler(CommandHandler("start", handlers.start, filters=direct))
+    app.add_handler(MessageHandler(direct & filters.TEXT & ~filters.COMMAND, handlers.on_text))
+    app.add_handler(MessageHandler(direct & (filters.VOICE | filters.AUDIO), handlers.on_voice))
+    app.add_handler(MessageHandler(direct & filters.PHOTO, handlers.on_photo))
+    app.add_handler(MessageHandler(direct & filters.Document.ALL, handlers.on_document))
     app.add_error_handler(_on_error)
 
     if app.job_queue is not None:
@@ -179,13 +208,20 @@ def main() -> None:
         # Drop the backlog. Telegram queues updates for 24h while the bot is
         # down, and answering yesterday's "what's AAPL at?" on restart is worse
         # than not answering it — stale prices, and the burst spends the quota.
-        app.run_polling(drop_pending_updates=True)
-    finally:
-        # Covers the tidy case where run_polling actually returns. It often does
-        # not — the observed zombie keeps the loop alive with polling dead — so
-        # the watchdog above is what usually catches it.
-        log.error("run_polling returned; exiting so the host restarts us")
-        _die()
+        # Messages only: every other update type is one Atlas has no handler for,
+        # and fetching it costs a round trip for nothing.
+        app.run_polling(drop_pending_updates=True, allowed_updates=[Update.MESSAGE])
+    except Exception:
+        log.exception("telegram polling crashed; exiting so the host restarts us")
+        _die(1)
+        return
+    # run_polling returns only after a stop signal: PTB catches SIGTERM and shuts
+    # the Application down in order. Nothing in Atlas calls stop_running, and a
+    # poller that dies underneath a running Application never returns here at
+    # all; the watchdog above catches that. So this is a deploy or a restart, and
+    # exiting 1 made every one of them read as a crash in the journal.
+    log.info("stopped on request; exiting")
+    _die(0)
 
 
 if __name__ == "__main__":

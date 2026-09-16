@@ -11,13 +11,13 @@ An AI financial analyst that lives in Telegram.
 Atlas holds a conversation. It learns who you are as you talk, pulls live market data, reads the documents you send it, and speaks up on its own when something on your watchlist actually matters.
 
 - **Conversation only.** No slash commands, no inline buttons, no menus. Onboarding happens by talking.
-- **Live market data** — quotes, fundamentals, price history, earnings dates, SEC filings, and grounded news.
+- **Live market data** — quotes, fundamentals, price history, earnings dates, SEC filings, and the day's headlines.
 - **Documents that keep their shape** — send a PDF, a spreadsheet, a Google Sheet link, or a photo of a chart.
 - **Voice** — send a voice note instead of typing.
 - **Memory that persists** — role, timezone, watchlist, and durable facts, across restarts.
 - **Proactive briefings and alerts**, including the decision *not* to send one.
 
-## Five decisions worth reading the code for
+## Seven decisions worth reading the code for
 
 ### 1. Documents are handed to the model whole
 
@@ -38,22 +38,30 @@ So the salience gate ([`atlas/proactive/salience.py`](atlas/proactive/salience.p
 - A malformed yes with an empty body is still silence.
 - A gate failure defaults to silence. A briefing nobody asked for is worse than one that never arrives.
 
-Push and pull run **different instructions against the same body**. An unprompted 7 a.m. ping must clear a high bar; "what's happening with my names?" must not; silence is the wrong answer to someone who just asked. That distinction is tested, not assumed.
+Silence is the right answer to "should I interrupt them?" and the wrong answer to "what's happening with my names?", so only the scheduled path has a gate. Asked directly, the tool hands the raw signals to the model already in the conversation rather than spending a second model call writing prose for the first one to rewrite.
 
 ### 3. Market data fails over, and the failover is measured from the host
 
 `yfinance` works perfectly from a laptop and is silently rate-limited from a datacenter IP. You cannot discover that locally; the deploy target is the only place the question has an answer.
 
-Atlas chains five quote providers and three fundamentals providers ([`atlas/integrations/marketdata.py`](atlas/integrations/marketdata.py)), and exposes `/diag` so provider health can be read **from the running host**:
+Atlas chains four quote providers and three fundamentals providers ([`atlas/integrations/marketdata.py`](atlas/integrations/marketdata.py)), and exposes `/diag` so provider health can be read **from the running host**:
 
 ```
-/diag  →  quotes:       finnhub ✓  fmp ✓  yahoo ✓  alphavantage ✓  yfinance ✓
-          fundamentals: finnhub ✓  fmp ✓  yfinance ✓
+/diag  ->  quotes:       finnhub ok  fmp ok  yahoo ok
+           fundamentals: finnhub ok  fmp ok
 ```
 
 That endpoint is why the deployed bot answers instead of apologising. Provider
-errors are scrubbed of API keys before they are shown; `/diag` is public, and an
-unscrubbed error hands out credentials.
+errors are scrubbed of API keys before they are shown, because an unscrubbed
+error hands out credentials. `/diag` answers on loopback unless the host has to
+reach it over the network, caches its answer for an hour, and leaves the
+daily-capped providers out of a routine check: probing cost Alpha Vantage 8 of
+its 25 daily requests per hit.
+
+Each provider is asked only about symbols its free tier actually covers. Finnhub
+and Alpha Vantage answer for US tickers, FMP for those and for indices, Yahoo for
+everything, which is what keeps a rupee-denominated quote from being labelled in
+dollars and stops a typo spending a daily-capped request.
 
 It also catches the failure mode that looks like a working system. Two providers
 once sat dead in the chain for weeks: one key was never set, and FMP answered
@@ -84,9 +92,45 @@ two live models ahead of it hit a `503` demand spike at the same moment, the 404
 was treated as a genuine fault, and the turn died. A 404 that names the requested
 model now counts as "retired": the chain skips it, logs it as an error because
 only a code change fixes it, and never spends the post-wait retry on it. Every
-chain (chat, news, fact extraction, the briefing gate) follows the same rule.
+chain (chat, fact extraction, the briefing gate) follows the same rule.
 
-### 5. Concurrency is per-user ordered, not free-for-all
+When no Gemini model answers at all, the turn moves to a different provider
+rather than waiting on the one that just refused three times. Groq's free tier
+serves open-weight models that call tools, so chat continues with the same system
+prompt and the same tools ([`atlas/engine/fallback.py`](atlas/engine/fallback.py)).
+Two things make it usable inside an 8,000-token-per-minute budget: Groq gets the
+first paragraph of each tool docstring rather than all twenty in full, and a
+token-window refusal is either waited out (when it asks for a second) or handed
+to the next model's own bucket, instead of the SDK sleeping half a minute. A
+measured fallback turn with two tool calls answers in about six seconds.
+
+Turns with an image or an uploaded document skip it: those files live in Gemini's
+Files API and no other provider can read them.
+
+### 5. An alert answers once, not every six hours
+
+A daily change does not move between the close and the next open, so "tell me if
+TSLA moves 5%" used to re-announce Friday's move overnight and all weekend: the
+condition still held, and a six-hour cooldown kept expiring. Alerts are now
+bounded by what actually changes. A price level is one-shot and says so when it
+fires; a move fires at most once per trading session, keyed on the session date
+the provider reports rather than on the calendar day here
+([`atlas/proactive/alerts.py`](atlas/proactive/alerts.py)).
+
+The same timestamp fixes the briefing: a Friday close read on a Saturday morning
+is the same move, already reported, not a new one.
+
+### 6. The bot is public, so a turn has a budget
+
+Anyone who finds the bot can talk to it, and every turn spends requests from a
+Gemini key shared with another project plus market-data quotas every user
+depends on. Each Telegram user gets one turn running and one queued, a burst
+limit, and a daily ceiling ([`atlas/ingress/guard.py`](atlas/ingress/guard.py)),
+refused in one sentence before any model or provider is called. It is in memory
+on purpose: a restart forgiving everyone is harmless, and a database round trip
+in front of every message is not.
+
+### 7. Concurrency is per-user ordered, not free-for-all
 
 Updates used to be processed strictly one at a time, so one slow turn (a PDF
 upload, a voice note) stalled every other user behind it.
@@ -121,7 +165,7 @@ flowchart TD
 
     subgraph WORK ["Gemini automatic function calling — no intent classifier to misroute"]
         direction LR
-        TOOLS["<b>tools/</b> · 20 tools<br/>quotes · fundamentals · comparisons<br/>price history · earnings · SEC filings<br/>grounded news · sheets · clarify<br/><i>each closure-bound to one user id</i>"]
+        TOOLS["<b>tools/</b> · 20 tools<br/>quotes · fundamentals · comparisons<br/>price history · earnings · SEC filings<br/>headlines · sheets · clarify<br/><i>each closure-bound to one user id</i>"]
         MEM["<b>memory/</b><br/>profile · durable facts<br/>watchlist · conversation history"]
     end
 
@@ -140,8 +184,9 @@ flowchart TD
 
     subgraph FAIL ["Failover, measured from the host"]
         direction TB
-        Q["<b>quotes</b> · finnhub → fmp → yahoo<br/>→ alphavantage → yfinance"]
+        Q["<b>quotes</b> · finnhub → fmp → yahoo<br/>→ alphavantage"]
         F["<b>fundamentals</b> · finnhub → fmp → yfinance"]
+        M["<b>models</b> · gemini 3.6 → 3.5 → 3 preview<br/>→ groq gpt-oss, a different provider"]
         DIAG["<b>/diag</b> · provider health read from<br/>the running host, keys scrubbed"]
     end
 
@@ -183,7 +228,7 @@ Read the red path first. Everything else is a conversation loop; the gate is the
 
 ## Stack
 
-Python 3.13 · python-telegram-bot 22 · Gemini (chat, vision, documents, grounded search) · Groq Whisper `large-v3-turbo` · PostgreSQL 18 + SQLAlchemy 2.0 / psycopg3 · APScheduler · Finnhub · FMP · Yahoo · Alpha Vantage · SEC EDGAR · Azure VM under systemd
+Python 3.13 · python-telegram-bot 22 · Gemini (chat, vision, documents) · Groq (`gpt-oss` fallback chat, Whisper `large-v3-turbo`) · PostgreSQL 18 + SQLAlchemy 2.0 / psycopg3 · APScheduler · Finnhub · FMP · Yahoo · Alpha Vantage · Google News · SEC EDGAR · Azure VM under systemd
 
 ## Tests
 

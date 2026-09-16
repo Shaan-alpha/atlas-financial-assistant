@@ -128,24 +128,49 @@ def test_market_overview_returns_the_three_major_indices(monkeypatch):
     assert dow["change_pct"] < 0  # 48000 vs 48100 previous close
 
 
-def test_price_history_summarizes_the_period(monkeypatch):
+def _history(rows, previous_close=None):
+    return lambda s, p: {
+        "rows": rows, "previous_close": previous_close, "currency": "USD", "source": "Yahoo Finance"
+    }
+
+
+def test_price_history_measures_from_the_close_before_the_period(monkeypatch):
+    """Measuring from the first bar inside the window dropped that session's
+    move, and made "1d" a single bar that always read 0%."""
     monkeypatch.setattr(
         market,
         "_fetch_history",
-        lambda s, p: [
-            {"date": "2026-08-03", "close": 300.0, "high": 305.0, "low": 298.0},
-            {"date": "2026-08-07", "close": 312.0, "high": 315.0, "low": 299.0},
-        ],
+        _history(
+            [
+                {"date": "2026-08-03", "close": 300.0, "high": 305.0, "low": 298.0},
+                {"date": "2026-08-07", "close": 312.0, "high": 315.0, "low": 299.0},
+            ],
+            previous_close=240.0,
+        ),
     )
 
     r = market.get_price_history("AAPL", "5d")
 
     assert r["ok"] is True
-    assert r["data"]["start_close"] == 300.0
+    assert r["data"]["base_close"] == 240.0
     assert r["data"]["end_close"] == 312.0
-    assert round(r["data"]["change_pct"], 2) == 4.0
+    assert round(r["data"]["change_pct"], 2) == 30.0
     assert r["data"]["period_high"] == 315.0
     assert r["data"]["period_low"] == 298.0
+    assert r["data"]["currency"] == "USD"
+    assert r["source"] == "Yahoo Finance"
+
+
+def test_one_day_history_is_todays_move(monkeypatch):
+    monkeypatch.setattr(
+        market,
+        "_fetch_history",
+        _history([{"date": "2026-09-15", "close": 212.17, "high": 213.94, "low": 211.16}], 210.96),
+    )
+
+    r = market.get_price_history("NVDA", "1d")
+
+    assert round(r["data"]["change_pct"], 2) == 0.57
 
 
 def test_price_history_rejects_unknown_period():
@@ -155,7 +180,7 @@ def test_price_history_rejects_unknown_period():
 
 
 def test_price_history_with_no_data_returns_error(monkeypatch):
-    monkeypatch.setattr(market, "_fetch_history", lambda s, p: [])
+    monkeypatch.setattr(market, "_fetch_history", lambda s, p: None)
 
     r = market.get_price_history("XYZQ", "5d")
 
@@ -163,29 +188,88 @@ def test_price_history_with_no_data_returns_error(monkeypatch):
     assert r["error"] == "no_history"
 
 
+def _calendar(dates, **extra):
+    return lambda s: {"dates": dates, "source": "Finnhub", **extra}
+
+
 def test_earnings_info_returns_next_date_and_estimates(monkeypatch):
+    monkeypatch.setattr(market, "_today", lambda: "2026-09-16")
     monkeypatch.setattr(
         market,
         "_fetch_calendar",
-        lambda s: {
-            "Earnings Date": ["2026-10-30"],
-            "Earnings Average": 1.97643,
-            "Revenue Average": 113256000000,
-        },
+        _calendar(["2026-10-30"], eps_estimate=1.97643, revenue_estimate=113256000000,
+                  timing="after the close"),
     )
 
     r = market.get_earnings_info("AAPL")
 
     assert r["ok"] is True
     assert r["data"]["next_earnings_date"] == "2026-10-30"
+    assert r["data"]["estimated_window"] is None
+    assert r["data"]["timing"] == "after the close"
     assert r["data"]["eps_estimate"] == 1.97643
     assert r["data"]["revenue_estimate"] == 113256000000
+    assert r["source"] == "Finnhub"
+
+
+def test_an_unconfirmed_window_is_not_presented_as_a_date(monkeypatch):
+    """Yahoo returns a two-date window until a company confirms; its first day
+    used to be reported as the scheduled date."""
+    monkeypatch.setattr(market, "_today", lambda: "2026-09-16")
+    monkeypatch.setattr(market, "_fetch_calendar", _calendar(["2026-10-27", "2026-10-31"]))
+
+    r = market.get_earnings_info("AAPL")
+
+    assert r["data"]["next_earnings_date"] is None
+    assert r["data"]["estimated_window"] == ["2026-10-27", "2026-10-31"]
+
+
+def test_a_date_already_past_is_not_the_next_report(monkeypatch):
+    monkeypatch.setattr(market, "_today", lambda: "2026-09-16")
+    monkeypatch.setattr(market, "_fetch_calendar", _calendar(["2026-07-30"]))
+
+    assert market.get_earnings_info("AAPL")["error"] == "no_earnings_date"
 
 
 def test_earnings_info_when_unscheduled(monkeypatch):
-    monkeypatch.setattr(market, "_fetch_calendar", lambda s: {})
+    monkeypatch.setattr(market, "_fetch_calendar", lambda s: None)
 
     r = market.get_earnings_info("AAPL")
 
     assert r["ok"] is False
     assert r["error"] == "no_earnings_date"
+
+
+def test_sources_name_the_providers_that_answered(monkeypatch):
+    """market_overview and compare_companies said "yfinance" whoever answered."""
+    monkeypatch.setattr(market, "_fetch_quote", _fake_quote)
+    monkeypatch.setattr(market, "_fetch_fundamentals", _fake_fundamentals)
+
+    assert market.market_overview()["source"] == "TestProvider"
+    assert market.compare_companies(["AAPL", "^GSPC"])["source"] == "TestProvider"
+
+
+def test_a_quote_carries_the_providers_trade_time(monkeypatch):
+    def _stamped(symbol):
+        quote = _fake_quote(symbol)
+        quote["as_of"] = "2026-09-15T20:00:01Z"
+        return quote
+
+    monkeypatch.setattr(market, "_fetch_quote", _stamped)
+
+    assert market.get_quote("AAPL")["as_of"] == "2026-09-15T20:00:01Z"
+
+
+def test_a_quote_with_no_trade_time_is_stamped_with_its_trading_day(monkeypatch):
+    """Alpha Vantage sends only "07. latest trading day". Stamping the answer with
+    the current time would present Friday's close as a Saturday price."""
+
+    def _daily_only(symbol):
+        quote = _fake_quote(symbol)
+        quote["as_of"] = None
+        quote["session_date"] = "2026-09-15"
+        return quote
+
+    monkeypatch.setattr(market, "_fetch_quote", _daily_only)
+
+    assert market.get_quote("AAPL")["as_of"] == "2026-09-15"

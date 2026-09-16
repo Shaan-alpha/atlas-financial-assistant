@@ -17,6 +17,9 @@ log = logging.getLogger(__name__)
 # day rather than tomorrow. The resync is a database read, so it is cheap.
 RESYNC_INTERVAL = dt.timedelta(minutes=5)
 JOB_PREFIX = "briefing:"
+# APScheduler's default grace is one second: any stall on the event loop at the
+# briefing minute (a slow turn, a restart) silently skipped that day's briefing.
+MISFIRE_GRACE = int(dt.timedelta(minutes=15).total_seconds())
 
 
 async def _run(context) -> None:
@@ -29,12 +32,20 @@ async def _run(context) -> None:
 
 def sync_jobs(job_queue) -> int:
     """Register or refresh a briefing job per opted-in user. Returns the count."""
+    # Roster first. Removing jobs before a read that then failed (Postgres
+    # restarting under the resync) left nobody scheduled until the next success.
+    try:
+        users = store.users_with_briefings()
+    except Exception:
+        log.exception("could not read the briefing roster; keeping existing jobs")
+        return 0
+
     for job in job_queue.jobs():
         if job.name and job.name.startswith(JOB_PREFIX):
             job.schedule_removal()
 
     registered = 0
-    for user in store.users_with_briefings():
+    for user in users:
         try:
             when = briefing.utc_time_for(user["briefing_time"], user["timezone"])
         except Exception:
@@ -50,6 +61,7 @@ def sync_jobs(job_queue) -> int:
             time=when,
             name=f"{JOB_PREFIX}{user['user_id']}",
             data=user,
+            job_kwargs={"misfire_grace_time": MISFIRE_GRACE},
         )
         registered += 1
 

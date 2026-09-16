@@ -2,6 +2,14 @@
 
 The user says "tell me if TSLA moves 5%" and the model turns that into a stored
 condition via the create_alert tool. This module owns evaluation and delivery.
+
+How often an alert may fire, decided 2026-09-16 after alerts were found firing
+every six hours for as long as a condition held:
+  - Price levels are one-shot. "Tell me if NVDA drops below 200" is answered
+    once; the watch then switches itself off and says so.
+  - Moves fire at most once per trading session. A daily change stays frozen
+    from the close until the next open, so without this Friday's 5% move was
+    re-announced overnight and all weekend.
 """
 
 import asyncio
@@ -16,11 +24,11 @@ log = logging.getLogger(__name__)
 
 CHECK_INTERVAL = dt.timedelta(minutes=15)
 
-# After firing, stay quiet for a while. A stock past a threshold is still past it
-# fifteen minutes later, and re-sending would turn one alert into a stream.
+# A backstop behind the session rule, for quotes that carry no session date.
 COOLDOWN = dt.timedelta(hours=6)
 
 KINDS = ("move_pct", "price_above", "price_below")
+ONE_SHOT = ("price_above", "price_below")
 
 
 def is_triggered(kind: str, threshold: float, quote: dict) -> bool:
@@ -43,6 +51,18 @@ def in_cooldown(last_fired_at, now: dt.datetime) -> bool:
     return (now - last_fired_at) < COOLDOWN
 
 
+def session_key(alert: dict, quote: dict) -> str | None:
+    """The ledger key that lets a move alert fire once per trading session."""
+    if alert["kind"] != "move_pct":
+        return None
+    if quote.get("session_date"):
+        return f"alert:{alert['id']}:{quote['session_date']}"
+    if quote.get("previous_close"):
+        # The previous close changes exactly when a new session starts.
+        return f"alert:{alert['id']}:pc{round(quote['previous_close'], 4)}"
+    return None
+
+
 def describe(alert: dict, quote: dict) -> str:
     symbol = alert["symbol"]
     price = quote.get("price")
@@ -57,12 +77,20 @@ def describe(alert: dict, quote: dict) -> str:
         headline = f"*{symbol}* has dropped below {alert['threshold']} — now {price}"
 
     # Echo their own wording so the alert reads like the thing they asked for.
-    return f"{headline}.\nYou asked me to watch for this: _{alert['description']}_"
+    text = f"{headline}.\nYou asked me to watch for this: _{alert['description']}_"
+    if alert["kind"] in ONE_SHOT:
+        text += "\nI've switched this watch off now. Ask me if you want it set again."
+    return text
 
 
-def _record_fired(alert: dict, now: dt.datetime, text: str) -> None:
-    """Cooldown stamp and conversation log, in one hop off the loop."""
+def _record_fired(alert: dict, now: dt.datetime, text: str, key: str | None) -> None:
+    """Cooldown stamp, session ledger, one-shot disarm and conversation log, in
+    one hop off the loop."""
     store.mark_alert_fired(alert["id"], now)
+    if key:
+        store.mark_sent(alert["user_id"], [key])
+    if alert["kind"] in ONE_SHOT:
+        store.disarm_alert(alert["id"])
     store.append_message(alert["user_id"], "model", text)
 
 
@@ -70,17 +98,26 @@ async def check_all(bot, now: dt.datetime | None = None) -> int:
     """Evaluate every armed alert. Returns how many fired."""
     now = now or dt.datetime.now(dt.timezone.utc).replace(tzinfo=None)
     fired = 0
+    # One fetch per symbol per sweep, however many alerts or users watch it.
+    quotes: dict[str, dict] = {}
 
     for alert in await asyncio.to_thread(store.active_alerts):
         if in_cooldown(alert["last_fired_at"], now):
             continue
 
-        # Blocking HTTP, once per armed alert. Off-thread, or the watcher
-        # freezes every conversation in flight for the length of the sweep.
-        quote = await asyncio.to_thread(market.get_quote, alert["symbol"])
+        symbol = alert["symbol"]
+        if symbol not in quotes:
+            # Blocking HTTP. Off-thread, or the watcher freezes every
+            # conversation in flight for the length of the sweep.
+            quotes[symbol] = await asyncio.to_thread(market.get_quote, symbol)
+        quote = quotes[symbol]
         if not quote["ok"]:
             continue
         if not is_triggered(alert["kind"], alert["threshold"], quote["data"]):
+            continue
+
+        key = session_key(alert, quote["data"])
+        if key and not await asyncio.to_thread(store.filter_unsent, alert["user_id"], [key]):
             continue
 
         text = describe(alert, quote["data"])
@@ -97,7 +134,7 @@ async def check_all(bot, now: dt.datetime | None = None) -> int:
                     log.exception("alert delivery failed for %s", alert["telegram_id"])
                     continue
 
-            await asyncio.to_thread(_record_fired, alert, now, text)
+            await asyncio.to_thread(_record_fired, alert, now, text, key)
         fired += 1
 
     if fired:

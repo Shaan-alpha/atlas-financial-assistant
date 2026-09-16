@@ -18,6 +18,19 @@ ALERT_KINDS = alerts.KINDS
 
 _VALID_TIME = re.compile(r"^([01]\d|2[0-3]):[0-5]\d$")
 
+# Per-user ceilings. Each armed alert costs a provider call every 15 minutes and
+# each watchlist name a quote, a filing and an earnings lookup every morning, on
+# free-tier quotas every user shares.
+MAX_ALERTS = 20
+MAX_WATCHLIST = 30
+
+
+def _symbol_is_quotable(symbol: str) -> bool:
+    """Seam. Tests replace this so they stay offline."""
+    from atlas.tools import market
+
+    return market.get_quote(symbol)["ok"]
+
 
 def _is_known_timezone(name: str) -> bool:
     try:
@@ -86,9 +99,9 @@ def make_memory_tools(user_id: int) -> list[Callable]:
             return err("nothing_to_update", "Give at least one field to update.")
 
         store.set_profile(user_id, **fields)
-        # Onboarding is done once we know their role.
-        if fields.get("role"):
-            store.set_profile(user_id, onboarding_state="done")
+        # Anything durable ends onboarding. Waiting for a role alone meant a user
+        # who skipped that question was greeted as a stranger on every turn.
+        store.set_profile(user_id, onboarding_state="done")
         return ok({"updated": fields, "profile": store.profile_snapshot(user_id)}, source=SOURCE)
 
     def add_to_watchlist(symbol: str, company: str = "") -> dict:
@@ -101,7 +114,16 @@ def make_memory_tools(user_id: int) -> list[Callable]:
             symbol: Ticker symbol, for example "NVDA".
             company: Optional company name for display.
         """
+        watchlist = store.get_watchlist(user_id)
+        ticker = symbol.strip().upper()
+        if len(watchlist) >= MAX_WATCHLIST and ticker not in {w["symbol"] for w in watchlist}:
+            return err(
+                "watchlist_full",
+                f"The watchlist holds {MAX_WATCHLIST} names. Ask which one to drop first.",
+            )
         added = store.add_watchlist(user_id, symbol, company or None)
+        if added:
+            store.set_profile(user_id, onboarding_state="done")
         return ok(
             {
                 "symbol": symbol.strip().upper(),
@@ -132,19 +154,28 @@ def make_memory_tools(user_id: int) -> list[Callable]:
         """Delete remembered facts matching a topic.
 
         Args:
-            topic: Substring to match, for example "EV" or "briefing".
+            topic: Word or phrase to match, for example "EV" or "briefing".
+                Plurals match, so "briefing" also removes "briefings".
         """
+        if not (topic or "").strip():
+            return err("need_topic", "Ask what they want forgotten before deleting anything.")
+        before = {f["fact"] for f in store.all_facts(user_id)}
         removed = store.forget(user_id, topic)
-        return ok({"removed": removed, "topic": topic}, source=SOURCE)
+        gone = sorted(before - {f["fact"] for f in store.all_facts(user_id)})
+        return ok({"removed": removed, "removed_facts": gone, "topic": topic}, source=SOURCE)
 
     def brief_me_now() -> dict:
-        """Compile the user's market briefing on demand, from their watchlist.
+        """Gather what is notable on the user's watchlist, for an on-demand briefing.
 
         Use when they ask for their briefing, what they missed, what's happening
         with their names, or to catch them up.
 
-        When has_news is false, tell them plainly that nothing on their watchlist
-        is worth their attention right now. Do not manufacture something to say.
+        Returns signals (moves with their headlines, fresh filings, earnings due),
+        not prose. Write the briefing yourself: most important item first, one
+        line each, at most six lines, why each matters to this user, and only
+        numbers present in the signals. When has_news is false, say plainly that
+        nothing on their watchlist needs attention right now; never manufacture
+        something. Call market_overview only if index levels would add to it.
 
         Args:
             None.
@@ -174,6 +205,17 @@ def make_memory_tools(user_id: int) -> list[Callable]:
             return err("bad_kind", f"kind must be one of: {', '.join(ALERT_KINDS)}.")
         if threshold <= 0:
             return err("bad_threshold", "Threshold must be greater than zero.")
+        if store.count_alerts(user_id) >= MAX_ALERTS:
+            return err(
+                "too_many_alerts",
+                f"They already have {MAX_ALERTS} alerts armed. Ask which to cancel first.",
+            )
+        if not _symbol_is_quotable(symbol):
+            return err(
+                "no_such_symbol",
+                f"No live quote for '{symbol}', so an alert on it could never fire. "
+                "Check the ticker with them.",
+            )
 
         alert_id = store.create_alert(user_id, description, symbol, kind, threshold)
         return ok(

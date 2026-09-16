@@ -11,6 +11,7 @@ reads as broken. Two pieces solve it:
 import json
 import logging
 import threading
+import time
 from http.server import BaseHTTPRequestHandler, HTTPServer
 
 import httpx
@@ -23,6 +24,11 @@ log = logging.getLogger(__name__)
 # host sees a healthy service, and the bot silently answers nobody for hours.
 # Reporting the truth here is what turns that into a restart.
 _polling_stopped = threading.Event()
+
+# /diag spends provider quota on every hit, so its answer is reused for a while.
+DIAG_TTL = 3600.0
+_diag_lock = threading.Lock()
+_diag_cache: dict = {}
 
 
 def mark_polling_stopped() -> None:
@@ -56,10 +62,8 @@ class _HealthHandler(BaseHTTPRequestHandler):
         ranges, so a laptop and a cloud host give different answers. This can only
         be measured from where the bot actually runs.
         """
-        from atlas.integrations import marketdata
-
-        payload = {"providers": marketdata.probe("AAPL")}
-        body = json.dumps(payload, indent=2).encode()
+        full = "all=1" in self.path
+        body = json.dumps(_diag_payload(full), indent=2).encode()
         self.send_response(200)
         self.send_header("Content-Type", "application/json")
         self.send_header("Content-Length", str(len(body)))
@@ -70,11 +74,28 @@ class _HealthHandler(BaseHTTPRequestHandler):
         """Silence per-request logging; the self-ping would flood the log."""
 
 
-def start_health_server(port: int) -> HTTPServer:
+def _diag_payload(full: bool) -> dict:
+    """The provider probe, cached. One lock so concurrent hits share one probe.
+
+    A routine probe skips Alpha Vantage (25 requests a day) and yfinance; ?all=1
+    includes them.
+    """
+    from atlas.integrations import marketdata
+
+    with _diag_lock:
+        cached = _diag_cache.get(full)
+        if cached and time.monotonic() - cached[0] < DIAG_TTL:
+            return cached[1]
+        payload = {"providers": marketdata.probe("AAPL", include_limited=full)}
+        _diag_cache[full] = (time.monotonic(), payload)
+        return payload
+
+
+def start_health_server(port: int, host: str = "0.0.0.0") -> HTTPServer:
     """Serve health checks from a daemon thread so it never blocks shutdown."""
-    server = HTTPServer(("0.0.0.0", port), _HealthHandler)
+    server = HTTPServer((host, port), _HealthHandler)
     threading.Thread(target=server.serve_forever, daemon=True).start()
-    log.info("health server listening on :%d", port)
+    log.info("health server listening on %s:%d", host, port)
     return server
 
 

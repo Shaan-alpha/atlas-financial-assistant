@@ -21,14 +21,22 @@ log = logging.getLogger(__name__)
 # "my fund is long NVDA", "we're bearish on EV". Gating on that skips the model
 # call entirely for the common case ("nvda price?"), which matters because
 # free-tier quota is only 5 requests per minute per model.
-_FIRST_PERSON = re.compile(r"\b(i|i'm|im|my|mine|me|we|we're|our|us)\b", re.IGNORECASE)
+#
+# Not "me" or "us": "tell me about NVDA" and "what is the US market doing" are
+# requests, and matching them spent an extraction call on most turns.
+_FIRST_PERSON = re.compile(r"\b(i|i'm|im|my|mine|we|we're|our)\b", re.IGNORECASE)
 _LONG_ENOUGH = 80
+# Sent by the handler when someone reopens the chat, not typed by them.
+_SYNTHETIC = {"i'm back."}
 
 
 def looks_durable(user_text: str) -> bool:
     """Cheap pre-filter deciding whether a turn is worth an extraction call."""
     text = (user_text or "").strip()
-    if not text:
+    if not text or text.lower() in _SYNTHETIC:
+        return False
+    # A question asks for something; it does not state something to remember.
+    if text.endswith("?"):
         return False
     return bool(_FIRST_PERSON.search(text)) or len(text) >= _LONG_ENOUGH
 
@@ -72,14 +80,15 @@ async def extract_and_store(user_id: int, user_text: str, reply: str) -> int:
         return 0
     try:
         items = await _extract(user_text, reply)
+        # One hop, not one per fact: add_fact is a SELECT + INSERT + COMMIT each,
+        # and this fires right after a reply went out — exactly when the loop has
+        # other people's turns to run. Inside the try: this task is detached, so
+        # a database error here would otherwise surface only as "Task exception
+        # was never retrieved".
+        return await asyncio.to_thread(_store_facts, user_id, items)
     except Exception:
         log.exception("fact extraction failed for user %s", user_id)
         return 0
-
-    # One hop, not one per fact: add_fact is a SELECT + INSERT + COMMIT each,
-    # and this fires right after a reply went out — exactly when the loop has
-    # other people's turns to run.
-    return await asyncio.to_thread(_store_facts, user_id, items)
 
 
 def _store_facts(user_id: int, items) -> int:

@@ -1,3 +1,5 @@
+import asyncio
+
 import pytest
 
 import atlas.engine.conversation as conversation
@@ -73,3 +75,63 @@ async def test_empty_model_text_does_not_send_blank_message(monkeypatch):
     reply = await conversation.respond(uid, "hello")
 
     assert reply.strip()
+
+
+async def test_a_recent_upload_stays_attached_for_follow_ups(monkeypatch):
+    """History is stored as text, so a follow-up about a PDF used to reach the
+    model with no PDF at all."""
+    import datetime as dt
+
+    seen = []
+
+    async def _fake(model, contents, system_prompt, tools):
+        seen.append(list(contents[-1].parts))
+        return _Resp("Segment margins widened.")
+
+    monkeypatch.setattr(conversation, "_generate", _fake)
+    uid = store.get_or_create_user(40, "Shaan")
+    store.add_document(uid, "https://files/abc", "results.pdf", "application/pdf")
+
+    await conversation.respond(uid, "and the segment margins?")
+
+    uris = [p.file_data.file_uri for p in seen[0] if p.file_data]
+    assert uris == ["https://files/abc"]
+    assert any("results.pdf" in (p.text or "") for p in seen[0])
+
+    # Past the window, the document is no longer paid for on every request.
+    monkeypatch.setattr(conversation, "DOCUMENT_FOLLOW_UP", dt.timedelta(seconds=-1))
+    await conversation.respond(uid, "what is NVDA at?")
+    assert not [p for p in seen[1] if p.file_data]
+
+
+
+async def test_a_turn_that_saved_memory_skips_background_extraction(monkeypatch):
+    """remember or add_to_watchlist already stored what the turn revealed; the
+    extractor then spent another request finding the same fact."""
+    from types import SimpleNamespace
+
+    import atlas.memory.extract as extract
+
+    spent = []
+
+    async def _extract(user_text, reply):
+        spent.append(user_text)
+        return []
+
+    class _WithCalls:
+        text = "Noted, I'll watch NVDA for you."
+        automatic_function_calling_history = [
+            SimpleNamespace(parts=[SimpleNamespace(function_call=SimpleNamespace(name="add_to_watchlist"))])
+        ]
+
+    async def _fake(model, contents, system_prompt, tools):
+        return _WithCalls()
+
+    monkeypatch.setattr(extract, "_extract", _extract)
+    monkeypatch.setattr(conversation, "_generate", _fake)
+    uid = store.get_or_create_user(41, "Shaan")
+
+    await conversation.respond(uid, "I hold a big position in NVDA")
+    await asyncio.sleep(0)
+
+    assert spent == []

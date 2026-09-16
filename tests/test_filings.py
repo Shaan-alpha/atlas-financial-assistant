@@ -51,3 +51,23 @@ def test_unknown_symbol_returns_error(monkeypatch):
 
     assert r["ok"] is False
     assert r["error"] == "no_such_issuer"
+
+
+def test_share_classes_written_with_a_dot_find_their_filer(monkeypatch):
+    """SEC lists Berkshire's class B as BRK-B; people and models write BRK.B."""
+    import atlas.tools.filings as filings_mod
+
+    monkeypatch.setattr(filings_mod, "_fetch_cik_map", lambda: {"BRK-B": "0001067983"})
+    monkeypatch.setattr(
+        filings_mod,
+        "_fetch_submissions",
+        lambda cik: {"name": "Berkshire", "filings": {"recent": {
+            "form": ["10-Q"], "filingDate": ["2026-08-03"],
+            "accessionNumber": ["0000950170-26-000001"], "primaryDocument": ["q.htm"],
+        }}},
+    )
+
+    result = filings_mod.get_recent_filings("BRK.B")
+
+    assert result["ok"] is True
+    assert result["data"]["filings"][0]["form"] == "10-Q"
